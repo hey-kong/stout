@@ -72,9 +72,9 @@ class FlashAttentionDiffKVBackend(FlashAttentionBackend):
             # num_kv_heads, head_size + head_size_v)
             return (1, 0, 2, 3, 4)
         elif cache_layout == "KV_NHD" and include_num_layers_dimension:
-            # (head_size + head_size_v, num_blocks, num_layers,
-            # block_size, num_kv_heads)
-            return (4, 1, 0, 2, 3)
+            # (num_blocks, num_layers, block_size,
+            # num_kv_heads, head_size + head_size_v)
+            return (1, 0, 2, 3, 4)
         elif cache_layout in ("NHD", "KV_NHD"):
             stride_order = (0, 1, 2, 3)
         elif cache_layout == "HND" and include_num_layers_dimension:
