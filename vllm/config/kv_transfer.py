@@ -69,13 +69,6 @@ class KVTransferConfig:
     'recompute': reschedule the request to recompute failed blocks (default)
     'fail': immediately fail the request with an error finish reason"""
 
-    save_decode_cache: bool = False
-    """Whether to save KV cache during decode phase.
-
-    This is a global KV transfer setting, independent from any specific
-    connector implementation.
-    """
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

@@ -4,7 +4,6 @@
 
 import copy
 from collections.abc import Callable
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -1431,6 +1430,8 @@ def test_cache_blocks_multi_group():
         kv_cache_group_id=1,
     )
     assert len(block_pool.cached_block_hash_to_block) == 5
+    assert len(req.block_hashes) == 3
+    assert all([block.block_hash is not None for block in blocks])
 
     # Block hash 0: hit for group 0 and 1
     # Block hash 1: hit for group 0 and 1
@@ -1470,34 +1471,6 @@ def test_cache_blocks_multi_group():
     assert (
         block_pool.get_cached_block(req.block_hashes[2], kv_cache_group_ids=[0, 1])
         is None
-    )
-
-
-@pytest.mark.parametrize(
-    ("save_decode_cache", "expected_tokens_to_cache"),
-    [(False, 4), (True, 8)],
-)
-def test_save_decode_cache(
-    save_decode_cache: bool,
-    expected_tokens_to_cache: int,
-):
-    block_size = 4
-    manager = KVCacheManager(
-        make_kv_cache_config(block_size, num_blocks=10),
-        max_model_len=128,
-        hash_block_size=block_size,
-        enable_caching=True,
-        save_decode_cache=save_decode_cache,
-    )
-
-    req = make_request("0", [1, 2, 3, 4], block_size, sha256)
-    manager.coordinator.cache_blocks = MagicMock()
-
-    # 8 computed tokens means 4 prompt + 4 decode tokens.
-    manager.cache_blocks(req, num_computed_tokens=8)
-
-    manager.coordinator.cache_blocks.assert_called_once_with(
-        req, expected_tokens_to_cache
     )
 
 
