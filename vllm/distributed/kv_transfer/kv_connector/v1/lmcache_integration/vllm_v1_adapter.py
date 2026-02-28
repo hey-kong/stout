@@ -670,8 +670,7 @@ class LMCacheConnectorV1Impl:
         # Prefer the global KV transfer setting. Keep the LMCache-specific
         # setting as a backward-compatible fallback.
         self._save_decode_cache = (
-            vllm_config.kv_transfer_config.save_decode_cache
-            or config.save_decode_cache
+            vllm_config.kv_transfer_config.save_decode_cache or config.save_decode_cache
         )
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
