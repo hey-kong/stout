@@ -6,7 +6,14 @@ from vllm.entrypoints.llm import LLM
 
 
 class _DummyEngine:
-    pass
+
+    def __init__(self):
+        self.model_config = object()
+        self.input_processor = object()
+        self.io_processor = object()
+
+    def get_supported_tasks(self):
+        return ["generate"]
 
 
 def test_save_decode_cache_as_top_level_llm_kwarg(monkeypatch):
