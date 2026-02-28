@@ -141,6 +141,8 @@ class LLM:
             compared with using gpu_memory_utilization. Note that
             kv_cache_memory_bytes (when not-None) ignores
             gpu_memory_utilization
+        save_decode_cache: Convenience option for setting
+            `kv_transfer_config.save_decode_cache`.
         swap_space: The size (GiB) of CPU memory per GPU to use as swap space.
             This can be used for temporarily storing the states of the requests
             when their `best_of` sampling parameters are larger than 1. If all
@@ -220,6 +222,7 @@ class LLM:
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
+        save_decode_cache: bool | None = None,
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
@@ -233,6 +236,19 @@ class LLM:
             # we serialize it using cloudpickle to avoid pickling issues
             if isinstance(worker_cls, type):
                 kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
+
+        if save_decode_cache is not None:
+            if (
+                "kv_transfer_config" not in kwargs
+                or kwargs["kv_transfer_config"] is None
+            ):
+                kwargs["kv_transfer_config"] = {
+                    "save_decode_cache": save_decode_cache,
+                }
+            elif isinstance(kwargs["kv_transfer_config"], dict):
+                kwargs["kv_transfer_config"]["save_decode_cache"] = save_decode_cache
+            else:
+                kwargs["kv_transfer_config"].save_decode_cache = save_decode_cache
 
         if "kv_transfer_config" in kwargs and isinstance(
             kwargs["kv_transfer_config"], dict
