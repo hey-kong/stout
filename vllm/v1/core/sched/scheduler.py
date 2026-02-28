@@ -228,7 +228,7 @@ class Scheduler(SchedulerInterface):
             save_decode_cache=(
                 self.vllm_config.kv_transfer_config.save_decode_cache
                 if self.vllm_config.kv_transfer_config is not None
-                else False
+                else True
             ),
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1

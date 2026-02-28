@@ -104,7 +104,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        save_decode_cache: bool = False,
+        save_decode_cache: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
 
