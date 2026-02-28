@@ -6,7 +6,6 @@ from vllm.entrypoints.llm import LLM
 
 
 class _DummyEngine:
-
     def __init__(self):
         self.model_config = object()
         self.input_processor = object()
