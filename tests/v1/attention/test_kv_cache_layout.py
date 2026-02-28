@@ -38,7 +38,7 @@ def test_kv_nhd_stride_order_with_layers(monkeypatch):
     ) == (1, 2, 0, 3, 4, 5)
     assert FlashInferBackend.get_kv_cache_stride_order(
         include_num_layers_dimension=True
-    ) == (1, 2, 0, 3, 4, 5)
+    ) == (2, 1, 0, 3, 4, 5)
 
 
 def test_flashinfer_layout_mapping_for_kv_nhd(monkeypatch):
