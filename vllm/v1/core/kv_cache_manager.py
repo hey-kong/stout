@@ -104,12 +104,14 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        save_decode_cache: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
 
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
         self.log_stats = log_stats
+        self.save_decode_cache = save_decode_cache
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
@@ -371,7 +373,10 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.coordinator.cache_blocks(
+            request,
+            self._get_num_tokens_to_cache(request, num_tokens_to_cache),
+        )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -472,6 +477,13 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def _get_num_tokens_to_cache(
+        self, request: Request, num_computed_tokens: int
+    ) -> int:
+        if self.save_decode_cache:
+            return num_computed_tokens
+        return min(num_computed_tokens, request.num_prompt_tokens)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
 
@@ -481,7 +493,10 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+            self.coordinator.cache_blocks(
+                request,
+                self._get_num_tokens_to_cache(request, num_computed_tokens),
+            )
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
