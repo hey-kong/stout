@@ -83,6 +83,7 @@ def test_config_interface():
 
     assumes(KVTransferConfig, "kv_role")
     assumes(KVTransferConfig, "kv_connector_extra_config")
+    assumes(KVTransferConfig, "save_decode_cache", is_instance_of=bool)
 
     assumes(ModelConfig, "use_mla", is_instance_of=bool)
     assumes(ModelConfig, "dtype")
