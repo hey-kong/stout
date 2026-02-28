@@ -296,6 +296,22 @@ class ReqMeta:
         if input_token_len == tracker.prompt_len:
             is_last_prefill = True
 
+        # Request-level override for save_decode_cache.
+        request_save_decode_cache = (tracker.request_configs or {}).get(
+            "lmcache.save_decode_cache"
+        )
+        if request_save_decode_cache is None:
+            effective_save_decode_cache = save_decode_cache
+        elif isinstance(request_save_decode_cache, bool):
+            effective_save_decode_cache = request_save_decode_cache
+        else:
+            logger.warning(
+                "Ignoring non-bool lmcache.save_decode_cache=%r for request %s",
+                request_save_decode_cache,
+                tracker.req_id,
+            )
+            effective_save_decode_cache = save_decode_cache
+
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
@@ -313,7 +329,7 @@ class ReqMeta:
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
             or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
-            or (tracker.is_decode_phase and not save_decode_cache)
+            or (tracker.is_decode_phase and not effective_save_decode_cache)
             or request_skip
         )
 
