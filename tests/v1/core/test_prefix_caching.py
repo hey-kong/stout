@@ -1477,7 +1477,7 @@ def test_cache_blocks_multi_group():
     ("save_decode_cache", "expected_tokens_to_cache"),
     [(False, 4), (True, 8)],
 )
-def test_save_decode_cache_controls_prefix_cache_commits(
+def test_save_decode_cache(
     save_decode_cache: bool,
     expected_tokens_to_cache: int,
 ):
