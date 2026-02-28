@@ -166,16 +166,24 @@ def trtllm_prefill_attn_kvfp8_dequant(
     return mock_kv_cache, mock_block_table
 
 
+def _get_flashinfer_kv_layout() -> str:
+    """Map vLLM KV cache layouts to FlashInfer-supported layout names."""
+    cache_layout = get_kv_cache_layout()
+    if cache_layout == "KV_NHD":
+        return "NHD"
+    return cache_layout
+
+
 class BatchDCPPrefillWrapper:
     def __init__(
         self,
         workspace_buffer: torch.Tensor | None = None,
     ):
         self._context = BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, get_kv_cache_layout()
+            workspace_buffer, _get_flashinfer_kv_layout()
         )
         self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(
-            workspace_buffer, get_kv_cache_layout()
+            workspace_buffer, _get_flashinfer_kv_layout()
         )
 
     def plan(
@@ -325,7 +333,10 @@ class FlashInferBackend(AttentionBackend):
         if cache_layout == "NHD" and include_num_layers_dimension:
             # (num_blocks, num_layers, 2, block_size, num_kv_heads, head_size)
             return (1, 0, 2, 3, 4, 5)
-        elif cache_layout == "NHD":
+        elif cache_layout == "KV_NHD" and include_num_layers_dimension:
+            # (2, num_blocks, num_layers, block_size, num_kv_heads, head_size)
+            return (1, 2, 0, 3, 4, 5)
+        elif cache_layout in ("NHD", "KV_NHD"):
             stride_order = (0, 1, 2, 3, 4)
         elif cache_layout == "HND" and include_num_layers_dimension:
             # (num_blocks, 2, num_kv_heads, num_layers, block_size, head_size)
@@ -678,7 +689,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
             else:
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(), get_kv_cache_layout()
+                    self._get_workspace_buffer(), _get_flashinfer_kv_layout()
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
@@ -700,7 +711,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_last_page_len = None
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
-                get_kv_cache_layout(),
+                _get_flashinfer_kv_layout(),
                 use_cuda_graph=use_cudagraph,
                 paged_kv_indptr_buffer=paged_kv_indptr,
                 paged_kv_indices_buffer=paged_kv_indices,
@@ -722,7 +733,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_cascade_wrapper(self):
         if self._cascade_wrapper is None:
             self._cascade_wrapper = MultiLevelCascadeAttentionWrapper(
-                2, self._get_workspace_buffer(), get_kv_cache_layout()
+                2, self._get_workspace_buffer(), _get_flashinfer_kv_layout()
             )
         return self._cascade_wrapper
 

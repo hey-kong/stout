@@ -125,7 +125,10 @@ class FlashAttentionBackend(AttentionBackend):
         if cache_layout == "NHD" and include_num_layers_dimension:
             # (num_blocks, num_layers, 2, block_size, num_kv_heads, head_size)
             return (2, 0, 1, 3, 4, 5)
-        elif cache_layout == "NHD":
+        elif cache_layout == "KV_NHD" and include_num_layers_dimension:
+            # (2, num_blocks, num_layers, block_size, num_kv_heads, head_size)
+            return (1, 2, 0, 3, 4, 5)
+        elif cache_layout in ("NHD", "KV_NHD"):
             stride_order = (0, 1, 2, 3, 4)
         elif cache_layout == "HND" and include_num_layers_dimension:
             # (num_blocks, num_kv_heads, num_layers, 2, block_size, head_size)
