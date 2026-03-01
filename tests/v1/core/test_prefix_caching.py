@@ -1389,7 +1389,7 @@ def test_cache_blocks(hash_fn):
     assert blocks[0].block_hash is not None
 
 
-def test_decode_blocks_not_saved_when_disabled():
+def test_save_decode_cache():
     block_size = 4
     manager = KVCacheManager(
         make_kv_cache_config(block_size=block_size, num_blocks=8),
