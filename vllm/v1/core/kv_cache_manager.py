@@ -104,6 +104,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        save_decode_cache: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -111,6 +112,7 @@ class KVCacheManager:
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        self.save_decode_cache = save_decode_cache
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
@@ -371,6 +373,8 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
+        if not self.save_decode_cache:
+            num_tokens_to_cache = min(num_tokens_to_cache, request.num_prompt_tokens)
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)

@@ -425,6 +425,7 @@ class EngineArgs:
     )
     block_size: BlockSize | None = CacheConfig.block_size
     enable_prefix_caching: bool | None = None
+    save_decode_cache: bool = CacheConfig.save_decode_cache
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -923,6 +924,9 @@ class EngineArgs:
             },
         )
         cache_group.add_argument(
+            "--save-decode-cache", **cache_kwargs["save_decode_cache"]
+        )
+        cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
         cache_group.add_argument("--cpu-offload-gb", **cache_kwargs["cpu_offload_gb"])
@@ -1414,6 +1418,7 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            save_decode_cache=self.save_decode_cache,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,

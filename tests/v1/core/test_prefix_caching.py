@@ -1389,6 +1389,31 @@ def test_cache_blocks(hash_fn):
     assert blocks[0].block_hash is not None
 
 
+def test_decode_blocks_not_saved_when_disabled():
+    block_size = 4
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size=block_size, num_blocks=8),
+        max_model_len=16,
+        enable_caching=True,
+        hash_block_size=block_size,
+        save_decode_cache=False,
+    )
+
+    request = make_request("0", [0, 1, 2, 3, 4, 5], block_size, sha256)
+    blocks = manager.allocate_slots(request, num_new_tokens=6)
+    assert blocks is not None
+
+    request.num_computed_tokens = 6
+    request.append_output_token_ids([6, 7])
+    blocks = manager.allocate_slots(request, num_new_tokens=2)
+    assert blocks is not None
+
+    probe = make_request("1", list(range(8)), block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(probe)
+
+    assert len(computed_blocks.blocks[0]) == 1
+    assert num_computed_tokens == block_size
+
 def test_cache_blocks_multi_group():
     """
     This tests that blocks are cached correctly for different kv cache groups.
