@@ -38,7 +38,7 @@ from vllm.v1.attention.backend import (
 )
 
 logger = init_logger(__name__)
-KVCacheLayoutType = Literal["NHD", "HND"]
+KVCacheLayoutType = Literal["NHD", "HND", "KV_NHD"]
 _KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None
 
 PAD_SLOT_ID = -1
@@ -53,7 +53,7 @@ def get_kv_cache_layout():
     # Format specified by the code.
     global _KV_CACHE_LAYOUT_OVERRIDE
 
-    cache_layout: Literal["NHD", "HND"] | None = None
+    cache_layout: Literal["NHD", "HND", "KV_NHD"] | None = None
     if _KV_CACHE_LAYOUT_OVERRIDE is not None:
         cache_layout = _KV_CACHE_LAYOUT_OVERRIDE
         logger.info_once(
