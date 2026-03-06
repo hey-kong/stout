@@ -2156,7 +2156,8 @@ class GPUModelRunner(
         num_prompt_tokens: int,
     ) -> None:
         req_state = self.requests[req_id]
-        req_block_ids = req_state.block_ids[0] if req_state.block_ids else []
+        kv_block_ids_by_group = tuple(list(group_ids) for group_ids in req_state.block_ids)
+        req_block_ids = kv_block_ids_by_group[0] if kv_block_ids_by_group else []
         req_num_blocks = len(req_block_ids)
         block_size = self.cache_config.block_size
         if self.kv_cache_config and self.kv_cache_config.kv_cache_groups:
@@ -2186,7 +2187,8 @@ class GPUModelRunner(
         logger.info(
             "[prefill-boundary] req_id=%s prefill_kv_shape=%s "
             "(computed_before=%d scheduled=%d prompt_tokens=%d "
-            "allocated_blocks=%d block_size=%d cache_capacity_shapes=%s)",
+            "allocated_blocks=%d block_size=%d kv_block_ids_by_group=%s "
+            "cache_capacity_shapes=%s)",
             req_id,
             req_kv_shape,
             num_computed_tokens,
@@ -2194,6 +2196,7 @@ class GPUModelRunner(
             num_prompt_tokens,
             req_num_blocks,
             block_size,
+            kv_block_ids_by_group,
             sorted({tuple(cache.shape) for cache in self.kv_caches}),
         )
 
