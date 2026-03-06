@@ -2114,6 +2114,45 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
+    def _find_prefill_boundary_req_id(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> str | None:
+        """Return request id if a single-request batch crosses prefill->decode."""
+        if self.input_batch.num_reqs != 1:
+            return None
+
+        req_id = self.input_batch.req_ids[0]
+        req_state = self.requests[req_id]
+        num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[0])
+        num_scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            req_state.prompt_token_ids, req_state.prompt_embeds
+        )
+
+        prefill_not_done = num_computed_tokens < num_prompt_tokens
+        reaches_prompt_end = (
+            num_computed_tokens + num_scheduled_tokens >= num_prompt_tokens
+        )
+        if prefill_not_done and reaches_prompt_end:
+            return req_id
+        return None
+
+    def _log_prefill_boundary_kv_cache_shape(self, req_id: str) -> None:
+        if not self.kv_caches:
+            logger.info(
+                "[prefill-boundary] req_id=%s, kv_cache is empty (no attention KV cache).",
+                req_id,
+            )
+            return
+
+        kv_shapes = [tuple(cache.shape) for cache in self.kv_caches]
+        unique_shapes = sorted(set(kv_shapes))
+        logger.info(
+            "[prefill-boundary] req_id=%s, kv_cache_shapes=%s",
+            req_id,
+            unique_shapes,
+        )
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -3473,6 +3512,8 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        prefill_boundary_req_id = self._find_prefill_boundary_req_id(scheduler_output)
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
@@ -3504,6 +3545,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if prefill_boundary_req_id is not None:
+            self._log_prefill_boundary_kv_cache_shape(prefill_boundary_req_id)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
