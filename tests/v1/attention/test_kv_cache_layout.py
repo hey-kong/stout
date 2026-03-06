@@ -16,25 +16,12 @@ def test_kv_nhd_stride_order_flash_attention_backends() -> None:
     _set_layout("KV_NHD")
     try:
         assert FlashAttentionBackend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
-        assert FlashAttentionBackend.get_kv_cache_stride_order(True) == (
-            2,
-            1,
-            0,
-            3,
-            4,
-            5,
-        )
+        assert FlashAttentionBackend.get_kv_cache_stride_order(True) == (2, 1, 0, 3, 4, 5)
 
         assert FlashInferBackend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
         assert FlashInferBackend.get_kv_cache_stride_order(True) == (1, 2, 0, 3, 4, 5)
 
         assert FlashAttentionDiffKVBackend.get_kv_cache_stride_order() == (0, 1, 2, 3)
-        assert FlashAttentionDiffKVBackend.get_kv_cache_stride_order(True) == (
-            1,
-            0,
-            2,
-            3,
-            4,
-        )
+        assert FlashAttentionDiffKVBackend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4)
     finally:
         _set_layout(None)
