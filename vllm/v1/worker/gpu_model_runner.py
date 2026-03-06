@@ -2114,43 +2114,73 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
-    def _find_prefill_boundary_req_id(
+    def _find_prefill_boundary_request_infos(
         self, scheduler_output: "SchedulerOutput"
-    ) -> str | None:
-        """Return request id if a single-request batch crosses prefill->decode."""
-        if self.input_batch.num_reqs != 1:
-            return None
+    ) -> list[tuple[str, int, int, int]]:
+        """Return requests that finish prefill in this scheduler step.
 
-        req_id = self.input_batch.req_ids[0]
-        req_state = self.requests[req_id]
-        num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[0])
-        num_scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
-        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            req_state.prompt_token_ids, req_state.prompt_embeds
-        )
-
-        prefill_not_done = num_computed_tokens < num_prompt_tokens
-        reaches_prompt_end = (
-            num_computed_tokens + num_scheduled_tokens >= num_prompt_tokens
-        )
-        if prefill_not_done and reaches_prompt_end:
-            return req_id
-        return None
-
-    def _log_prefill_boundary_kv_cache_shape(self, req_id: str) -> None:
-        if not self.kv_caches:
-            logger.info(
-                "[prefill-boundary] req_id=%s, kv_cache is empty (no attention KV cache).",
-                req_id,
+        Each tuple is (req_id, num_computed_tokens, num_scheduled_tokens,
+        num_prompt_tokens), where `num_computed_tokens` is the value before this
+        forward step.
+        """
+        boundary_infos: list[tuple[str, int, int, int]] = []
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[index])
+            num_scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req_state.prompt_token_ids, req_state.prompt_embeds
             )
-            return
 
-        kv_shapes = [tuple(cache.shape) for cache in self.kv_caches]
-        unique_shapes = sorted(set(kv_shapes))
+            prefill_not_done = num_computed_tokens < num_prompt_tokens
+            reaches_prompt_end = (
+                num_computed_tokens + num_scheduled_tokens >= num_prompt_tokens
+            )
+            if prefill_not_done and reaches_prompt_end:
+                boundary_infos.append(
+                    (
+                        req_id,
+                        num_computed_tokens,
+                        num_scheduled_tokens,
+                        num_prompt_tokens,
+                    )
+                )
+
+        return boundary_infos
+
+    def _log_prefill_boundary_kv_cache_shape(
+        self,
+        req_id: str,
+        num_computed_tokens: int,
+        num_scheduled_tokens: int,
+        num_prompt_tokens: int,
+    ) -> None:
+        req_state = self.requests[req_id]
+        req_block_ids = req_state.block_ids[0] if req_state.block_ids else []
+        req_num_blocks = len(req_block_ids)
+        block_size = self.input_batch.block_sizes[0]
+
+        # `self.kv_caches` is pre-allocated global storage (layer-major), so its
+        # shape is capacity-level and not per-request. Print a request-level view
+        # in token space to show the prefill boundary clearly.
+        req_kv_shape = (
+            len(self.kv_caches),
+            num_prompt_tokens,
+            self.num_kv_heads,
+            self.head_size,
+        )
         logger.info(
-            "[prefill-boundary] req_id=%s, kv_cache_shapes=%s",
+            "[prefill-boundary] req_id=%s prefill_kv_shape=%s "
+            "(computed_before=%d scheduled=%d prompt_tokens=%d "
+            "allocated_blocks=%d block_size=%d cache_capacity_shapes=%s)",
             req_id,
-            unique_shapes,
+            req_kv_shape,
+            num_computed_tokens,
+            num_scheduled_tokens,
+            num_prompt_tokens,
+            req_num_blocks,
+            block_size,
+            sorted({tuple(cache.shape) for cache in self.kv_caches}),
         )
 
     def _calc_spec_decode_metadata(
@@ -3512,7 +3542,7 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
-        prefill_boundary_req_id = self._find_prefill_boundary_req_id(scheduler_output)
+        prefill_boundary_infos = self._find_prefill_boundary_request_infos(scheduler_output)
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -3546,8 +3576,8 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        if prefill_boundary_req_id is not None:
-            self._log_prefill_boundary_kv_cache_shape(prefill_boundary_req_id)
+        for boundary_info in prefill_boundary_infos:
+            self._log_prefill_boundary_kv_cache_shape(*boundary_info)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
