@@ -2158,7 +2158,9 @@ class GPUModelRunner(
         req_state = self.requests[req_id]
         req_block_ids = req_state.block_ids[0] if req_state.block_ids else []
         req_num_blocks = len(req_block_ids)
-        block_size = self.input_batch.block_sizes[0]
+        block_size = self.cache_config.block_size
+        if self.kv_cache_config and self.kv_cache_config.kv_cache_groups:
+            block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
 
         # `self.kv_caches` is pre-allocated global storage (layer-major), so its
         # shape is capacity-level and not per-request. Print a request-level view
