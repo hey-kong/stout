@@ -336,7 +336,7 @@ class FlashInferBackend(AttentionBackend):
             # (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size)
             return (1, 2, 0, 3, 4, 5)
         elif cache_layout == "KV_NHD":
-            stride_order = (1, 0, 2, 3, 4)
+            stride_order = (0, 1, 2, 3, 4)
         else:
             raise ValueError(f"Unknown cache layout format {cache_layout}.")
         return stride_order
