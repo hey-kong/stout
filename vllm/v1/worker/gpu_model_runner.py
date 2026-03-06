@@ -2165,11 +2165,23 @@ class GPUModelRunner(
         # `self.kv_caches` is pre-allocated global storage (layer-major), so its
         # shape is capacity-level and not per-request. Print a request-level view
         # in token space to show the prefill boundary clearly.
+        kv_num_heads = None
+        kv_head_size = None
+        if self.kv_cache_config is not None:
+            for group in self.kv_cache_config.kv_cache_groups:
+                kv_cache_spec = group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    kv_num_heads = kv_cache_spec.num_kv_heads
+                    kv_head_size = kv_cache_spec.head_size
+                    break
+
         req_kv_shape = (
             len(self.kv_caches),
             num_prompt_tokens,
-            self.num_kv_heads,
-            self.head_size,
+            kv_num_heads,
+            kv_head_size,
         )
         logger.info(
             "[prefill-boundary] req_id=%s prefill_kv_shape=%s "
