@@ -2114,6 +2114,89 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
+    def _find_prefill_boundary_request_infos(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[tuple[str, int, int, int]]:
+        """Return requests that finish prefill in this scheduler step.
+
+        Each tuple is (req_id, num_computed_tokens, num_scheduled_tokens,
+        num_prompt_tokens), where `num_computed_tokens` is the value before this
+        forward step.
+        """
+        boundary_infos: list[tuple[str, int, int, int]] = []
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[index])
+            num_scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req_state.prompt_token_ids, req_state.prompt_embeds
+            )
+
+            prefill_not_done = num_computed_tokens < num_prompt_tokens
+            reaches_prompt_end = (
+                num_computed_tokens + num_scheduled_tokens >= num_prompt_tokens
+            )
+            if prefill_not_done and reaches_prompt_end:
+                boundary_infos.append(
+                    (
+                        req_id,
+                        num_computed_tokens,
+                        num_scheduled_tokens,
+                        num_prompt_tokens,
+                    )
+                )
+
+        return boundary_infos
+
+    def _log_prefill_boundary_kv_cache_shape(
+        self,
+        req_id: str,
+        num_computed_tokens: int,
+        num_scheduled_tokens: int,
+        num_prompt_tokens: int,
+    ) -> None:
+        req_state = self.requests[req_id]
+        req_block_ids = req_state.block_ids[0] if req_state.block_ids else []
+        req_num_blocks = len(req_block_ids)
+        block_size = self.cache_config.block_size
+        if self.kv_cache_config and self.kv_cache_config.kv_cache_groups:
+            block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+
+        # `self.kv_caches` is pre-allocated global storage (layer-major), so its
+        # shape is capacity-level and not per-request. Print a request-level view
+        # in token space to show the prefill boundary clearly.
+        kv_num_heads = None
+        kv_head_size = None
+        if self.kv_cache_config is not None:
+            for group in self.kv_cache_config.kv_cache_groups:
+                kv_cache_spec = group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    kv_num_heads = kv_cache_spec.num_kv_heads
+                    kv_head_size = kv_cache_spec.head_size
+                    break
+
+        req_kv_shape = (
+            len(self.kv_caches),
+            num_prompt_tokens,
+            kv_num_heads,
+            kv_head_size,
+        )
+        logger.info(
+            "[prefill-boundary] req_id=%s prefill_kv_shape=%s "
+            "(computed_before=%d scheduled=%d prompt_tokens=%d "
+            "allocated_blocks=%d block_size=%d cache_capacity_shapes=%s)",
+            req_id,
+            req_kv_shape,
+            num_computed_tokens,
+            num_scheduled_tokens,
+            num_prompt_tokens,
+            req_num_blocks,
+            block_size,
+            sorted({tuple(cache.shape) for cache in self.kv_caches}),
+        )
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -3473,6 +3556,8 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        prefill_boundary_infos = self._find_prefill_boundary_request_infos(scheduler_output)
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
@@ -3504,6 +3589,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        for boundary_info in prefill_boundary_infos:
+            self._log_prefill_boundary_kv_cache_shape(*boundary_info)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
