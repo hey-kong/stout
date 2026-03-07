@@ -2114,6 +2114,154 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
+    def _find_prefill_boundary_request_infos(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[tuple[str, int, int, int]]:
+        """Return requests that finish prefill in this scheduler step.
+
+        Each tuple is (req_id, num_computed_tokens, num_scheduled_tokens,
+        num_prompt_tokens), where `num_computed_tokens` is the value before this
+        forward step.
+        """
+        boundary_infos: list[tuple[str, int, int, int]] = []
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[index])
+            num_scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req_state.prompt_token_ids, req_state.prompt_embeds
+            )
+
+            prefill_not_done = num_computed_tokens < num_prompt_tokens
+            reaches_prompt_end = (
+                num_computed_tokens + num_scheduled_tokens >= num_prompt_tokens
+            )
+            if prefill_not_done and reaches_prompt_end:
+                boundary_infos.append(
+                    (
+                        req_id,
+                        num_computed_tokens,
+                        num_scheduled_tokens,
+                        num_prompt_tokens,
+                    )
+                )
+
+        return boundary_infos
+
+    def _get_kv_cache_layout_debug_info(self) -> tuple[str | None, tuple[int, ...] | None, tuple[str, ...] | None]:
+        """Return backend name, stride order, and physical dim names with num_layers."""
+        if self.kv_cache_config is None:
+            return None, None, None
+
+        for gid, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+            kv_cache_spec = group_spec.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                continue
+
+            attn_group = self.attn_groups[gid][0]
+            backend = attn_group.backend
+            backend_name = backend.__class__.__name__
+            logical_shape = backend.get_kv_cache_shape(
+                num_blocks=1,
+                block_size=kv_cache_spec.block_size,
+                num_kv_heads=kv_cache_spec.num_kv_heads,
+                head_size=kv_cache_spec.head_size,
+                cache_dtype_str=self.cache_config.cache_dtype,
+            )
+
+            logical_dim_names = [None] * len(logical_shape)
+            for i, val in enumerate(logical_shape):
+                if val == 2:
+                    logical_dim_names[i] = "kv"
+                elif val == kv_cache_spec.block_size:
+                    logical_dim_names[i] = "block_size"
+                elif val == kv_cache_spec.num_kv_heads:
+                    logical_dim_names[i] = "num_kv_heads"
+                elif val == kv_cache_spec.head_size:
+                    logical_dim_names[i] = "head_size"
+                elif val == 1:
+                    logical_dim_names[i] = "num_blocks"
+            for i, name in enumerate(logical_dim_names):
+                if name is None:
+                    logical_dim_names[i] = f"dim_{i}"
+
+            logical_with_layers = ["num_layers", *logical_dim_names]
+            try:
+                stride_order = backend.get_kv_cache_stride_order(
+                    include_num_layers_dimension=True
+                )
+                physical_dim_names = tuple(logical_with_layers[idx] for idx in stride_order)
+            except (AttributeError, NotImplementedError):
+                stride_order = None
+                physical_dim_names = tuple(logical_with_layers)
+
+            return backend_name, stride_order, physical_dim_names
+
+        return None, None, None
+
+    def _log_prefill_boundary_kv_cache_shape(
+        self,
+        req_id: str,
+        num_computed_tokens: int,
+        num_scheduled_tokens: int,
+        num_prompt_tokens: int,
+    ) -> None:
+        req_state = self.requests[req_id]
+        kv_block_ids_by_group = tuple(list(group_ids) for group_ids in req_state.block_ids)
+        req_block_ids = kv_block_ids_by_group[0] if kv_block_ids_by_group else []
+        req_num_blocks = len(req_block_ids)
+        block_size = self.cache_config.block_size
+        if self.kv_cache_config and self.kv_cache_config.kv_cache_groups:
+            block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+
+        # `self.kv_caches` is pre-allocated global storage (layer-major), so its
+        # shape is capacity-level and not per-request. Print a request-level view
+        # in token space to show the prefill boundary clearly.
+        kv_num_heads = None
+        kv_head_size = None
+        if self.kv_cache_config is not None:
+            for group in self.kv_cache_config.kv_cache_groups:
+                kv_cache_spec = group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    kv_num_heads = kv_cache_spec.num_kv_heads
+                    kv_head_size = kv_cache_spec.head_size
+                    break
+
+        req_kv_shape = (
+            len(self.kv_caches),
+            num_prompt_tokens,
+            kv_num_heads,
+            kv_head_size,
+        )
+        backend_name, stride_order, physical_dim_names = (
+            self._get_kv_cache_layout_debug_info()
+        )
+
+        logger.info(
+            "[prefill-boundary] req_id=%s prefill_kv_shape=%s "
+            "(computed_before=%d scheduled=%d prompt_tokens=%d "
+            "allocated_blocks=%d block_size=%d kv_block_ids_by_group=%s "
+            "cache_capacity_shapes=%s kv_backend=%s "
+            "kv_stride_order_with_num_layers=%s "
+            "single_cache_block_layout=%s)",
+            req_id,
+            req_kv_shape,
+            num_computed_tokens,
+            num_scheduled_tokens,
+            num_prompt_tokens,
+            req_num_blocks,
+            block_size,
+            kv_block_ids_by_group,
+            sorted({tuple(cache.shape) for cache in self.kv_caches}),
+            backend_name,
+            stride_order,
+            physical_dim_names,
+        )
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -3473,6 +3621,8 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        prefill_boundary_infos = self._find_prefill_boundary_request_infos(scheduler_output)
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
@@ -3504,6 +3654,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        for boundary_info in prefill_boundary_infos:
+            self._log_prefill_boundary_kv_cache_shape(*boundary_info)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
