@@ -2148,6 +2148,59 @@ class GPUModelRunner(
 
         return boundary_infos
 
+    def _get_kv_cache_layout_debug_info(self) -> tuple[str | None, tuple[int, ...] | None, tuple[str, ...] | None]:
+        """Return backend name, stride order, and physical dim names with num_layers."""
+        if self.kv_cache_config is None:
+            return None, None, None
+
+        for gid, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+            kv_cache_spec = group_spec.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                continue
+
+            attn_group = self.attn_groups[gid][0]
+            backend = attn_group.backend
+            backend_name = backend.__class__.__name__
+            logical_shape = backend.get_kv_cache_shape(
+                num_blocks=1,
+                block_size=kv_cache_spec.block_size,
+                num_kv_heads=kv_cache_spec.num_kv_heads,
+                head_size=kv_cache_spec.head_size,
+                cache_dtype_str=self.cache_config.cache_dtype,
+            )
+
+            logical_dim_names = [None] * len(logical_shape)
+            for i, val in enumerate(logical_shape):
+                if val == 2:
+                    logical_dim_names[i] = "kv"
+                elif val == kv_cache_spec.block_size:
+                    logical_dim_names[i] = "block_size"
+                elif val == kv_cache_spec.num_kv_heads:
+                    logical_dim_names[i] = "num_kv_heads"
+                elif val == kv_cache_spec.head_size:
+                    logical_dim_names[i] = "head_size"
+                elif val == 1:
+                    logical_dim_names[i] = "num_blocks"
+            for i, name in enumerate(logical_dim_names):
+                if name is None:
+                    logical_dim_names[i] = f"dim_{i}"
+
+            logical_with_layers = ["num_layers", *logical_dim_names]
+            try:
+                stride_order = backend.get_kv_cache_stride_order(
+                    include_num_layers_dimension=True
+                )
+                physical_dim_names = tuple(logical_with_layers[idx] for idx in stride_order)
+            except (AttributeError, NotImplementedError):
+                stride_order = None
+                physical_dim_names = tuple(logical_with_layers)
+
+            return backend_name, stride_order, physical_dim_names
+
+        return None, None, None
+
     def _log_prefill_boundary_kv_cache_shape(
         self,
         req_id: str,
@@ -2184,11 +2237,17 @@ class GPUModelRunner(
             kv_num_heads,
             kv_head_size,
         )
+        backend_name, stride_order, physical_dim_names = (
+            self._get_kv_cache_layout_debug_info()
+        )
+
         logger.info(
             "[prefill-boundary] req_id=%s prefill_kv_shape=%s "
             "(computed_before=%d scheduled=%d prompt_tokens=%d "
             "allocated_blocks=%d block_size=%d kv_block_ids_by_group=%s "
-            "cache_capacity_shapes=%s)",
+            "cache_capacity_shapes=%s kv_backend=%s "
+            "kv_stride_order_with_num_layers=%s "
+            "single_cache_block_layout=%s)",
             req_id,
             req_kv_shape,
             num_computed_tokens,
@@ -2198,6 +2257,9 @@ class GPUModelRunner(
             block_size,
             kv_block_ids_by_group,
             sorted({tuple(cache.shape) for cache in self.kv_caches}),
+            backend_name,
+            stride_order,
+            physical_dim_names,
         )
 
     def _calc_spec_decode_metadata(
