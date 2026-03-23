@@ -240,6 +240,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="The memory layout for host memory pool",
     )
 
+    assert ServerArgs.use_layerwise == True
+    parser.add_argument(
+        "--disable-layerwise",
+        action="store_false",
+        dest="use_layerwise",
+        help=(
+            "Disable layer-wise HiCache loading. When set, hit KV cache is fully transferred "
+            "to HBM before compute."
+        ),
+    )
+
     parser.add_argument(
         "--shell-mode",
         action="store_true",

@@ -18,6 +18,7 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     hicache_ratio: float = 2.0
     host_mem_layout: str = "layer_first"
+    use_layerwise: bool = True
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
