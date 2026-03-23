@@ -134,11 +134,6 @@ class HiCacheController(HiCacheTransferMixin):
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
         self.page_size = config.page_size
-        self.use_pagewise_load = (
-            not self.use_layerwise
-            and config.device_mem_layout == "page_first"
-            and config.host_mem_layout == "page_first"
-        )
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
@@ -195,9 +190,9 @@ class HiCacheController(HiCacheTransferMixin):
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
-            if self.use_pagewise_load:
-                # Page-first + non-layerwise mode prefers page-by-page transfer with all layers
-                # to avoid slow fine-grained per-layer load_one copies.
+            if not self.use_layerwise:
+                # Non-layerwise mode always uses page-by-page all-layer transfer.
+                # This keeps transfer granularity controlled only by `use_layerwise`.
                 for i in range(0, num_tokens, self.page_size):
                     self.load_all(
                         host_indices=host_indices[i : i + self.page_size],
@@ -208,9 +203,8 @@ class HiCacheController(HiCacheTransferMixin):
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
             finish_event = counter.events[-1]
-            if self.use_pagewise_load:
-                finish_event.record(self.load_stream)
             if not self.use_layerwise:
+                finish_event.record(self.load_stream)
                 # Force full host->HBM transfer completion before model forward starts.
                 # This matches radix-like behavior: KV cache is fully in HBM for compute.
                 current_stream.wait_event(finish_event)
