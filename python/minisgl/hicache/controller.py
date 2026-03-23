@@ -191,8 +191,6 @@ class HiCacheController(HiCacheTransferMixin):
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if not self.use_layerwise:
-                # Non-layerwise mode always uses page-by-page all-layer transfer.
-                # This keeps transfer granularity controlled only by `use_layerwise`.
                 for i in range(0, num_tokens, self.page_size):
                     self.load_all(
                         host_indices=host_indices[i : i + self.page_size],
