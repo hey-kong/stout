@@ -161,9 +161,10 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices: torch.Tensor,
     ) -> None:
         host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
+        cuda_list = _split_by_lengths(cuda_indices, [len(t) for t in host_list])
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
-        self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
+        self.load_queue.append(Transaction(host_handle, host_list, cuda_list))
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
@@ -191,11 +192,7 @@ class HiCacheController(HiCacheTransferMixin):
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if not self.use_layerwise:
-                for i in range(0, num_tokens, self.page_size):
-                    self.load_all(
-                        host_indices=host_indices[i : i + self.page_size],
-                        cuda_indices=cuda_indices[i : i + self.page_size],
-                    )
+                self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
@@ -306,6 +303,17 @@ class HiCacheController(HiCacheTransferMixin):
 def _create_event(enable_timing: bool = False) -> torch.Event:
     return torch.cuda.Event(enable_timing=enable_timing)  # type: ignore
 
-
 def _make_ptrs(ts: List[torch.Tensor], device: torch.device):
     return torch.tensor([t.data_ptr() for t in ts], device=device, dtype=torch.uint64)
+
+def _split_by_lengths(t: torch.Tensor, lengths: List[int]) -> List[torch.Tensor]:
+    if not lengths:
+        return []
+    if sum(lengths) != len(t):
+        raise ValueError(f"split size mismatch: total={sum(lengths)}, length={len(t)}")
+    out: List[torch.Tensor] = []
+    start = 0
+    for length in lengths:
+        out.append(t[start : start + length])
+        start += length
+    return out
