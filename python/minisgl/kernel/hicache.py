@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import functools
+import torch
 from typing import TYPE_CHECKING
 
 from .utils import load_aot, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 DEFAULT_BLOCK_QUOTA = 2
@@ -147,6 +147,42 @@ def transfer_hicache_all_layer(
         kv_cache_src_stride_bytes,
         kv_cache_dst_stride_bytes,
     )
+
+
+def transfer_hicache_page(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    *,
+    page_size: int,
+) -> None:
+    if len(indices_src) == 0:
+        return
+    assert len(indices_src) == len(indices_dst), (
+        f"indices_src and indices_dst must have the same length, "
+        f"got {len(indices_src)=}, {len(indices_dst)=}"
+    )
+    assert len(indices_src) % page_size == 0, (
+        f"indices length must be divisible by page_size, got {len(indices_src)=}, {page_size=}"
+    )
+    src_pages = _token_indices_to_page_indices(indices_src, page_size)
+    dst_pages = _token_indices_to_page_indices(indices_dst, page_size)
+    k_cache_dst.index_copy_(0, dst_pages, k_cache_src.index_select(0, src_pages))
+    v_cache_dst.index_copy_(0, dst_pages, v_cache_src.index_select(0, src_pages))
+
+
+def _token_indices_to_page_indices(indices: torch.Tensor, page_size: int) -> torch.Tensor:
+    page_matrix = indices.view(-1, page_size)
+    page_start = page_matrix[:, :1]
+    expected = page_start + torch.arange(page_size, device=indices.device, dtype=indices.dtype)
+    assert torch.equal(page_matrix, expected), (
+        "Expected each page token index block to be contiguous. "
+        "If this assertion is hit, fall back to token-level load."
+    )
+    return page_start[:, 0] // page_size
 
 
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
