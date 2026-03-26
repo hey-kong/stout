@@ -214,29 +214,14 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
         host_indices: torch.Tensor | None = None
         cuda_indices: torch.Tensor | None = None
-        if not self.pagewise_load:
-            host_indices, cuda_indices = self._merge_transactions(self.load_queue)
-            num_tokens = len(host_indices)
-        else:
-            num_tokens = sum(len(tx.host_list[i]) for tx in self.load_queue for i in range(len(tx.host_list)))
+        host_indices, cuda_indices = self._merge_transactions(self.load_queue)
+        num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if self.pagewise_load:
-                for _, host_values, cuda_values in self.load_queue:
-                    for host_value, cuda_value in zip(host_values, cuda_values):
-                        assert host_value.shape == cuda_value.shape, (
-                            f"Shape mismatch: host_value.shape={host_value.shape}, "
-                            f"cuda_value.shape={cuda_value.shape}"
-                        )
-                        assert host_value.dtype == cuda_value.dtype, (
-                            f"Dtype mismatch: host_value.dtype={host_value.dtype}, "
-                            f"cuda_value.dtype={cuda_value.dtype}"
-                        )
-                        host_indices = host_value
-                        cuda_indices = cuda_value
-                        self.load_page(host_indices=host_indices, cuda_indices=cuda_indices)
+                self.load_page(host_indices=host_indices, cuda_indices=cuda_indices)
             elif not self.use_layerwise:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
