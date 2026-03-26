@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from minisgl.kvcache.hiradix_cache import HiRadixPrefixCache
     from minisgl.scheduler import SchedulerConfig
 
-
 logger = init_logger(__name__)
 
 
@@ -54,10 +53,10 @@ RESET_ACK_THRESHOLD = 512
 
 class HiCacheTransferMixin:
     def __init__(
-        self,
-        cuda_kv: List[torch.Tensor],
-        host_kv: List[torch.Tensor],
-        config: SchedulerConfig,
+            self,
+            cuda_kv: List[torch.Tensor],
+            host_kv: List[torch.Tensor],
+            config: SchedulerConfig,
     ) -> None:
         self.load_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
@@ -111,6 +110,46 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
+    def load_pages(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        if len(host_indices) == 0:
+            return
+
+        assert self._cuda_page is not None and self._host_page is not None
+        assert len(host_indices) == len(cuda_indices)
+        assert len(host_indices) % self.page_size == 0, \
+            "page-wise load requires page-aligned length"
+
+        num_pages = len(host_indices) // self.page_size
+
+        # fast path
+        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
+                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
+            host_page_start = int(host_indices[0].item()) // self.page_size
+            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_page_start:host_page_start + num_pages],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[1][host_page_start:host_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            host_page = int(host_indices[i * self.page_size].item()) // self.page_size
+            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page].copy_(
+                self._host_page[0][host_page],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page].copy_(
+                self._host_page[1][host_page],
+                non_blocking=True,
+            )
+
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_layer
 
@@ -126,24 +165,6 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
-    def load_page(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
-        from minisgl.kernel import transfer_hicache_one_page
-
-        assert len(host_indices) == len(cuda_indices)
-        assert len(host_indices) % self.page_size == 0, "page-wise load requires page-aligned length"
-        if len(host_indices) == 0:
-            return
-        assert torch.all(host_indices % self.page_size == 0)
-        assert torch.all(cuda_indices % self.page_size == 0)
-        transfer_hicache_one_page(
-            k_cache_dst=self._cuda_page[0],
-            v_cache_dst=self._cuda_page[1],
-            indices_dst=cuda_indices[:: self.page_size].div(self.page_size, rounding_mode="floor"),
-            k_cache_src=self._host_page[0],
-            v_cache_src=self._host_page[1],
-            indices_src=host_indices[:: self.page_size].div(self.page_size, rounding_mode="floor"),
-        )
-
 
 class HiCacheController(HiCacheTransferMixin):
     def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
@@ -157,16 +178,16 @@ class HiCacheController(HiCacheTransferMixin):
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
         self.pagewise_load = (
-            config.device_mem_layout == "page_first"
-            and config.host_mem_layout == "page_first"
-            and not self.use_layerwise
+                config.device_mem_layout == "page_first"
+                and config.host_mem_layout == "page_first"
+                and not self.use_layerwise
         )
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
         num_host_pages = int(num_pages * config.hicache_ratio)
         num_host_tokens = num_host_pages * config.page_size
-        total_bytes_gb = num_host_tokens * self.token_bytes / (1024**3)
+        total_bytes_gb = num_host_tokens * self.token_bytes / (1024 ** 3)
         self.free_slots = torch.arange(num_host_tokens, dtype=torch.int32, device="cpu")
         logger.info(
             f"Allocating {num_host_tokens} tokens "
@@ -187,16 +208,15 @@ class HiCacheController(HiCacheTransferMixin):
             assert self._host_page[1].is_contiguous()
 
     def prepare_load(
-        self,
-        host_handle: BaseCacheHandle,
-        cuda_handle: BaseCacheHandle,
-        cuda_indices: torch.Tensor,
+            self,
+            host_handle: BaseCacheHandle,
+            cuda_handle: BaseCacheHandle,
+            cuda_indices: torch.Tensor,
     ) -> None:
         host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
-        cuda_list = _split_by_lengths(cuda_indices, [len(t) for t in host_list])
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
-        self.load_queue.append(Transaction(host_handle, host_list, cuda_list))
+        self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
@@ -217,29 +237,20 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
-        host_indices: torch.Tensor | None = None
-        cuda_indices: torch.Tensor | None = None
-        if not self.pagewise_load:
-            host_indices, cuda_indices = self._merge_transactions(self.load_queue)
-            num_tokens = len(host_indices)
-        else:
-            num_tokens = sum(len(tx.host_list[i]) for tx in self.load_queue for i in range(len(tx.host_list)))
+        host_indices, cuda_indices = self._merge_transactions(self.load_queue)
+        num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if self.pagewise_load:
-                for _, host_values, cuda_values in self.load_queue:
-                    for host_value, cuda_value in zip(host_values, cuda_values):
-                        host_indices = host_value.to(self.device, non_blocking=True)
-                        cuda_indices = cuda_value
-                        self.load_page(host_indices, cuda_indices)
-            elif not self.use_layerwise:
-                self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
-            else:
+                self.load_pages(host_indices=host_indices, cuda_indices=cuda_indices)
+            elif self.use_layerwise:
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
+            else:
+                self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             finish_event = counter.events[-1]
             if not self.use_layerwise:
                 finish_event.record(self.load_stream)
@@ -335,7 +346,7 @@ class HiCacheController(HiCacheTransferMixin):
 
     def _log_transaction(self, ack: Ack, stage: str):
         dur = ack.start_event.elapsed_time(ack.finish_event)
-        bandwidth = (self.token_bytes * ack.num_tokens / (1024**3)) / (dur / 1000)
+        bandwidth = (self.token_bytes * ack.num_tokens / (1024 ** 3)) / (dur / 1000)
         logger.info(
             f"HiCache {stage} [{ack.ack_id}]: {ack.num_tokens:>5} tokens: "
             f"duration = {dur:>5.2f} ms, bandwidth = {bandwidth:>5.2f} GB/s"
@@ -349,15 +360,3 @@ def _create_event(enable_timing: bool = False) -> torch.Event:
 
 def _make_ptrs(ts: List[torch.Tensor], device: torch.device):
     return torch.tensor([t.data_ptr() for t in ts], device=device, dtype=torch.uint64)
-
-def _split_by_lengths(t: torch.Tensor, lengths: List[int]) -> List[torch.Tensor]:
-    if not lengths:
-        return []
-    if sum(lengths) != len(t):
-        raise ValueError(f"split size mismatch: total={sum(lengths)}, length={len(t)}")
-    out: List[torch.Tensor] = []
-    start = 0
-    for length in lengths:
-        out.append(t[start : start + length])
-        start += length
-    return out

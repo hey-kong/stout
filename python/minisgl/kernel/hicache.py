@@ -149,44 +149,6 @@ def transfer_hicache_all_layer(
     )
 
 
-def transfer_hicache_one_page(
-    k_cache_dst: torch.Tensor,
-    v_cache_dst: torch.Tensor,
-    indices_dst: torch.Tensor,
-    k_cache_src: torch.Tensor,
-    v_cache_src: torch.Tensor,
-    indices_src: torch.Tensor,
-    *,
-    element_dim: int | None = None,
-    unroll: int | None = None,  # can be tuned for performance
-    block_quota: int | None = None,  # can be tuned for less interference
-) -> None:
-    # Cache layout: [num_pages, page_size, num_layers, num_kv_heads, head_dim].
-    # Treat one whole page as one transfer element.
-    if element_dim is None:
-        element_dim = k_cache_dst[0].numel()
-    k_cache_src = k_cache_src.view(-1, element_dim)
-    v_cache_src = v_cache_src.view(-1, element_dim)
-    k_cache_dst = k_cache_dst.view(-1, element_dim)
-    v_cache_dst = v_cache_dst.view(-1, element_dim)
-    element_size = element_dim * k_cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
-    module = _jit_hicache_module(
-        element_size=element_size,
-        unroll=unroll,
-        block_quota=block_quota,
-    )
-    module.launch_one(
-        k_cache_dst,
-        v_cache_dst,
-        indices_dst,
-        k_cache_src,
-        v_cache_src,
-        indices_src,
-    )
-
-
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
     import torch
 
