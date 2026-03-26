@@ -67,6 +67,10 @@ class HiCacheTransferMixin:
         self.device = cuda_kv[0].device
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
+        # page-major views: [num_pages, page_size, num_layers, num_kv_heads, head_dim]
+        # one page slice is contiguous in page_first layout.
+        self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
+        self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
@@ -133,6 +137,11 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
+        self.pagewise_load = (
+            config.device_mem_layout == "page_first"
+            and config.host_mem_layout == "page_first"
+            and not self.use_layerwise
+        )
         self.page_size = config.page_size
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
@@ -153,6 +162,11 @@ class HiCacheController(HiCacheTransferMixin):
             host_kv=list(self.host_pool.get_kv_storage()),
             config=config,
         )
+        if self.pagewise_load:
+            assert self._cuda_page[0].is_contiguous()
+            assert self._cuda_page[1].is_contiguous()
+            assert self._host_page[0].is_contiguous()
+            assert self._host_page[1].is_contiguous()
 
     def prepare_load(
         self,
@@ -185,13 +199,33 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
-        host_indices, cuda_indices = self._merge_transactions(self.load_queue)
-        num_tokens = len(host_indices)
+        host_indices: torch.Tensor | None = None
+        cuda_indices: torch.Tensor | None = None
+        if not self.pagewise_load:
+            host_indices, cuda_indices = self._merge_transactions(self.load_queue)
+            num_tokens = len(host_indices)
+        else:
+            num_tokens = sum(len(tx.host_list[i]) for tx in self.load_queue for i in range(len(tx.host_list)))
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
-            if not self.use_layerwise:
+            if self.pagewise_load:
+                for _, host_values, cuda_values in self.load_queue:
+                    for host_value, cuda_value in zip(host_values, cuda_values):
+                        assert host_value.shape == cuda_value.shape, (
+                            f"Shape mismatch: host_value.shape={host_value.shape}, "
+                            f"cuda_value.shape={cuda_value.shape}"
+                        )
+                        assert host_value.dtype == cuda_value.dtype, (
+                            f"Dtype mismatch: host_value.dtype={host_value.dtype}, "
+                            f"cuda_value.dtype={cuda_value.dtype}"
+                        )
+                        host_indices = host_value.to(self.device, non_blocking=True)
+                        cuda_indices = cuda_value
+                        # TODO: We need `load_page` to enable page-level loading instead of `transfer_hicache_all_layer` in `load_all`, which is layer-level loading.
+                        self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
+            elif not self.use_layerwise:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 for i in range(self.num_layers):
