@@ -149,7 +149,7 @@ def transfer_hicache_all_layer(
     )
 
 
-def transfer_hicache_page(
+def transfer_hicache_all_page(
     k_cache_dst: torch.Tensor,
     v_cache_dst: torch.Tensor,
     indices_dst: torch.Tensor,

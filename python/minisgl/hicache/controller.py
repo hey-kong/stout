@@ -128,7 +128,15 @@ class HiCacheTransferMixin:
     def load_all_page(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_page
 
-        # TODO: achieve transfer_hicache_all_page and invoke
+        transfer_hicache_all_page(
+            k_cache_dst=self._cuda_page[0],
+            v_cache_dst=self._cuda_page[1],
+            indices_dst=cuda_indices,
+            k_cache_src=self._host_page[0],
+            v_cache_src=self._host_page[1],
+            indices_src=host_indices,
+            page_size=self.page_size,
+        )
 
 
 class HiCacheController(HiCacheTransferMixin):

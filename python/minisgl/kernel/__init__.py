@@ -1,8 +1,8 @@
 from .hicache import (
     allocate_host,
+    transfer_hicache_all_page,
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
-    transfer_hicache_page,
 )
 from .index import indexing
 from .moe_impl import fused_moe_kernel_triton, moe_sum_reduce_triton
@@ -23,5 +23,5 @@ __all__ = [
     "moe_sum_reduce_triton",
     "transfer_hicache_one_layer",
     "transfer_hicache_all_layer",
-    "transfer_hicache_page",
+    "transfer_hicache_all_page",
 ]
