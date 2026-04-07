@@ -320,7 +320,8 @@ class HiRadixPrefixCache(BasePrefixCache):
             node.cuda_value = None
             node = node.parent
         if dropped_len != length:
-            logger.info_rank0(
+            log_fn = logger.debug_rank0 if dropped_len == 0 else logger.info_rank0
+            log_fn(
                 f"HiCache Quick Demotion: dropped {dropped_len} / {length} tokens "
                 "(remaining tokens are still referenced)"
             )
