@@ -3,8 +3,8 @@
 import time
 from random import randint, seed
 
-from minisgl.core import SamplingParams
-from minisgl.llm import LLM
+from stout.core import SamplingParams
+from stout.llm import LLM
 
 
 def main():

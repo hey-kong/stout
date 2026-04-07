@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "minisgl"
+name = "stout"
 version = "0.1.0"
 description = "What is this?"
 readme = "README.md"
@@ -111,7 +111,7 @@ python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
     "--strict-config",
-    "--cov=minisgl",
+    "--cov=stout",
     "--cov-report=term-missing",
     "--cov-report=html",
 ]
