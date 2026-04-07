@@ -223,6 +223,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.hicache_ratio,
         help="The host memory to device memory ratio. Only used when cache=hiradix",
     )
+    parser.add_argument(
+        "--hicache-quick-demotion",
+        action="store_true",
+        default=ServerArgs.hicache_quick_demotion,
+        help=(
+            "Enable quick demotion for HiCache. Newly-written KV blocks are demoted from HBM after "
+            "they are asynchronously copied to DRAM. They will be loaded back to HBM on access."
+        ),
+    )
 
     parser.add_argument(
         "--hicache-quick-demotion",

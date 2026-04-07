@@ -175,6 +175,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.free_cuda_slots = free_cuda_slots
         self.load_queue: List[Transaction] = []
         self.write_queue: List[Transaction] = []
+        self.pending_demotions: List[tuple[BaseCacheHandle, int]] = []
         self.ack_load_queue: List[Ack] = []
         self.ack_write_queue: List[Ack] = []
         self.ack_cnt = 0
@@ -313,8 +314,12 @@ class HiCacheController(HiCacheTransferMixin):
             for handle, demote_len in zip(ack.handles, ack.demote_lens):
                 self.hiradix_cache.lock_handle(handle, unlock=True)
                 if demote_len > 0:
-                    self.free_cuda_slots(self.hiradix_cache.drop_cuda(handle, demote_len))
+                    dropped_indices, dropped_len = self.hiradix_cache.drop_cuda(handle, demote_len)
+                    self.free_cuda_slots(dropped_indices)
+                    if dropped_len < demote_len:
+                        self.pending_demotions.append((handle, demote_len - dropped_len))
         self.ack_write_queue = self.ack_write_queue[finish_count:]
+        self._retry_pending_demotions()
 
     def _merge_transactions(self, txs: List[Transaction]):
         assert len(txs) > 0
@@ -334,6 +339,17 @@ class HiCacheController(HiCacheTransferMixin):
                 return None
         allocated, self.free_slots = self.free_slots[:length], self.free_slots[length:]
         return allocated
+
+    def _retry_pending_demotions(self) -> None:
+        if not self.pending_demotions:
+            return
+        remain: List[tuple[BaseCacheHandle, int]] = []
+        for handle, needed_len in self.pending_demotions:
+            dropped_indices, dropped_len = self.hiradix_cache.drop_cuda(handle, needed_len)
+            self.free_cuda_slots(dropped_indices)
+            if dropped_len < needed_len:
+                remain.append((handle, needed_len - dropped_len))
+        self.pending_demotions = remain
 
     def _allocate_counter(self) -> HiCacheCounter:
         self.ring_index = (self.ring_index + 1) % RING_SIZE

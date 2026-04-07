@@ -297,12 +297,12 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
-    def drop_cuda(self, handle: BaseCacheHandle, length: int) -> torch.Tensor:
+    def drop_cuda(self, handle: BaseCacheHandle, length: int) -> tuple[torch.Tensor, int]:
         assert isinstance(handle, HiRadixCacheHandle)
         assert length >= 0
         if length == 0:
             logger.info_rank0("HiCache Quick Demotion: dropped 0 tokens")
-            return self.empty_tensor
+            return self.empty_tensor, 0
         node = handle.node
         dropped_len = 0
         dropped_indices: List[torch.Tensor] = []
@@ -326,7 +326,8 @@ class HiRadixPrefixCache(BasePrefixCache):
             )
         else:
             logger.info_rank0(f"HiCache Quick Demotion: dropped {dropped_len} tokens")
-        return torch.cat(dropped_indices) if dropped_indices else self.empty_tensor
+        dropped = torch.cat(dropped_indices) if dropped_indices else self.empty_tensor
+        return dropped, dropped_len
 
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
