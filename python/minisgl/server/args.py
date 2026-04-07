@@ -234,6 +234,16 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--hicache-quick-demotion",
+        action="store_true",
+        default=ServerArgs.hicache_quick_demotion,
+        help=(
+            "Enable quick demotion for HiCache. Newly-written KV blocks are demoted from HBM after "
+            "they are asynchronously copied to DRAM. They will be loaded back to HBM on access."
+        ),
+    )
+
+    parser.add_argument(
         "--device-mem-layout",
         "--device-layout",
         type=str,

@@ -285,9 +285,7 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.write_stream)
         self.write_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_write_queue.append(
-            Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event)
-        )
+        self.ack_write_queue.append(Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event))
         logger.info_rank0(f"HiCache Write [{ack_id}]: {num_tokens:>5} tokens")
 
     def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
