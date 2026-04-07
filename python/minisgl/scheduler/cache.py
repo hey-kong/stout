@@ -90,7 +90,9 @@ class CacheManager:
         old_handle = req.cache_handle
         cached_len, new_handle = self._prefix_cache.insert_prefix(insert_ids, page_indices)
         if self.enable_hicache:
-            self._hicache_controller.prepare_write(new_handle)
+            # NOTE: quick demotion can safely run only after request completion.
+            # For unfinished requests, the handle will continue to serve decode.
+            self._hicache_controller.prepare_write(new_handle, allow_demotion=finished)
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it
@@ -136,8 +138,14 @@ class CacheManager:
         return allocated
 
     def _free(self, indices: torch.Tensor) -> None:
-        if len(indices) > 0:
-            self._free_slots = torch.cat([self._free_slots, indices[:: self.page_size]])
+        if len(indices) == 0:
+            return
+        freed_pages = torch.unique(indices[:: self.page_size])
+        if len(self._free_slots) > 0:
+            # Guard against accidental double-free, which can corrupt future allocations.
+            freed_pages = freed_pages[~torch.isin(freed_pages, self._free_slots)]
+        if len(freed_pages) > 0:
+            self._free_slots = torch.cat([self._free_slots, freed_pages])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

@@ -219,7 +219,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
         self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
 
-    def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
+    def prepare_write(self, cuda_handle: BaseCacheHandle, *, allow_demotion: bool = True) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
         if needed_len < self.page_size:
             return
@@ -229,7 +229,7 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(host_indices) == needed_len
         cuda_list = self.hiradix_cache.set_host(cuda_handle, host_indices)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
-        demote_len = needed_len if self.hicache_quick_demotion else 0
+        demote_len = needed_len if (self.hicache_quick_demotion and allow_demotion) else 0
         self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list, demote_len))
         self.start_write()  # do not batch write for now
 
