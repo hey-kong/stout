@@ -306,6 +306,32 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
+    if kwargs["cache_type"] == "hiradix":
+        required_hiradix_options = {
+            "device_mem_layout": "page_first",
+            "host_mem_layout": "page_first",
+            "use_layerwise": False,
+            "hicache_quick_demotion": True,
+        }
+        mismatched_options = {
+            key: (kwargs[key], expected)
+            for key, expected in required_hiradix_options.items()
+            if kwargs[key] != expected
+        }
+        if mismatched_options:
+            mismatch_info = ", ".join(
+                f"{key}={actual!r} (expected {expected!r})"
+                for key, (actual, expected) in mismatched_options.items()
+            )
+            parser.error(
+                "cache_type='hiradix' requires fixed options: "
+                "device_mem_layout='page_first', "
+                "host_mem_layout='page_first', "
+                "use_layerwise=False, "
+                "hicache_quick_demotion=True. "
+                f"Got: {mismatch_info}"
+            )
+
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
