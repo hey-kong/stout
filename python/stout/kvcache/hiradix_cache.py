@@ -33,12 +33,22 @@ class HiRadixTreeNode:
         self._cuda_value: torch.Tensor | None = None
         self._host_value: torch.Tensor | None = None
         self._length: int
+        self.ghost_timestamp: int | None = None
 
     def on_cuda_only(self) -> bool:
         return self._cuda_value is not None and self._host_value is None
 
     def on_host_only(self) -> bool:
         return self._cuda_value is None and self._host_value is not None
+
+    def has_cuda_value(self) -> bool:
+        return self._cuda_value is not None
+
+    def has_host_value(self) -> bool:
+        return self._host_value is not None
+
+    def is_ghost(self) -> bool:
+        return self._cuda_value is None and self._host_value is None
 
     def set_key_value(
         self,
@@ -152,6 +162,9 @@ class HiRadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = HiRadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
+        self.host_size = 0
+        self.ghost_size = 0
+        self.ghost_heap: List[Tuple[int, int, HiRadixTreeNode]] = []
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, HiRadixCacheHandle)
@@ -175,8 +188,11 @@ class HiRadixPrefixCache(BasePrefixCache):
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         host_node, host_prefix_len = self._tree_walk(input_ids)
+        while not host_node.is_root() and host_node.is_ghost():
+            host_prefix_len -= host_node.length
+            host_node = host_node.parent
         cuda_node, cuda_prefix_len = host_node, host_prefix_len
-        while not cuda_node.is_root() and cuda_node.on_host_only():
+        while not cuda_node.is_root() and not cuda_node.has_cuda_value():
             cuda_prefix_len -= cuda_node.length
             cuda_node = cuda_node.parent
         return MatchResult(
@@ -188,8 +204,11 @@ class HiRadixPrefixCache(BasePrefixCache):
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         host_node, host_prefix_len = self._tree_walk(input_ids)
+        while not host_node.is_root() and host_node.is_ghost():
+            host_prefix_len -= host_node.length
+            host_node = host_node.parent
         cuda_node, cuda_prefix_len = host_node, host_prefix_len
-        while not cuda_node.is_root() and cuda_node.on_host_only():
+        while not cuda_node.is_root() and not cuda_node.has_cuda_value():
             cuda_prefix_len -= cuda_node.length
             cuda_node = cuda_node.parent
         self.evictable_size += host_prefix_len - cuda_prefix_len
@@ -253,10 +272,12 @@ class HiRadixPrefixCache(BasePrefixCache):
 
             evicted_size += node.length
             evicted_indices.append(node.host_value)
-            parent = node.parent
-            del parent.children[self.key_fn(node._key)]
-            if parent.ref_count == 0 and parent.is_leaf_host():
-                heapq.heappush(leave_nodes, parent)
+            node.host_value = None
+            node.ghost_timestamp = time.monotonic_ns()
+            self.host_size -= node.length
+            self.ghost_size += node.length
+            heapq.heappush(self.ghost_heap, (node.ghost_timestamp, node.uuid, node))
+            self._trim_ghost_nodes()
 
         return evicted_indices
 
@@ -275,6 +296,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         result: List[torch.Tensor] = []
         while not node.is_root() and node.on_cuda_only():
             node.host_value = indices[-node.length :]
+            self.host_size += node.length
             indices = indices[: -node.length]
             result.append(node.cuda_value)
             node = node.parent
@@ -323,6 +345,30 @@ class HiRadixPrefixCache(BasePrefixCache):
                 for child in node.children.values():
                     nodes.append(child)
         return leave_nodes
+
+    def _trim_ghost_nodes(self) -> None:
+        while self.ghost_size > self.host_size and self.ghost_heap:
+            _, _, node = heapq.heappop(self.ghost_heap)
+            if (
+                node.is_root()
+                or node.ref_count > 0
+                or not node.is_ghost()
+                or not node.is_leaf_host()
+                or node.ghost_timestamp is None
+            ):
+                continue
+
+            parent = node.parent
+            del parent.children[self.key_fn(node._key)]
+            self.ghost_size -= node.length
+            if (
+                not parent.is_root()
+                and parent.ref_count == 0
+                and parent.is_ghost()
+                and parent.is_leaf_host()
+                and parent.ghost_timestamp is not None
+            ):
+                heapq.heappush(self.ghost_heap, (parent.ghost_timestamp, parent.uuid, parent))
 
     def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[HiRadixTreeNode, int]:
         prefix_len = 0
