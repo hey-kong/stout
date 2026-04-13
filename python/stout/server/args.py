@@ -225,6 +225,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--external-cache-ratio",
+        type=float,
+        default=ServerArgs.external_cache_ratio,
+        help="Reserve HBM memory for external cache (e.g. compressed V cache), as a ratio against normal KV cache.",
+    )
+
+    parser.add_argument(
         "--device-mem-layout",
         "--device-layout",
         type=str,

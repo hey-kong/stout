@@ -160,6 +160,18 @@ class Engine:
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            external_cache_ratio = float(getattr(config, "external_cache_ratio", 0.0))
+            assert external_cache_ratio >= 0, "external_cache_ratio must be non-negative"
+
+            if external_cache_ratio > 0:
+                kv_memory = int(available_memory / (1.0 + external_cache_ratio))
+                external_memory = available_memory - kv_memory
+                logger.info(
+                    f"Reserving HBM memory for external cache: "
+                    f"{mem_GB(external_memory)} (ratio={external_cache_ratio})"
+                )
+                available_memory = kv_memory
+
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
