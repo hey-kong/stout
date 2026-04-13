@@ -1,3 +1,3 @@
-from .quant_compressor import KVQuantMeta, QuantMeta, QuantizedCompressor
+from .quant_compressor import QuantMeta, QuantizedCompressor
 
-__all__ = ["QuantMeta", "KVQuantMeta", "QuantizedCompressor"]
+__all__ = ["QuantMeta", "QuantizedCompressor"]
