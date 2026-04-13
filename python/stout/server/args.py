@@ -223,6 +223,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.hicache_ratio,
         help="The host memory to device memory ratio. Only used when cache=hiradix",
     )
+    parser.add_argument(
+        "--kv-offloading-size",
+        type=float,
+        default=ServerArgs.kv_offloading_size,
+        help=(
+            "Explicit host KV offloading size in GB. "
+            "If set, this takes precedence over --hicache-ratio."
+        ),
+    )
 
     parser.add_argument(
         "--device-mem-layout",
@@ -261,6 +270,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
+    if (offload_size := kwargs["kv_offloading_size"]) is not None and offload_size <= 0:
+        parser.error("--kv-offloading-size must be greater than 0")
     if run_shell:
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
