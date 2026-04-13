@@ -240,14 +240,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="The memory layout for host memory pool",
     )
 
-    assert ServerArgs.use_layerwise == True
+    assert ServerArgs.use_layerwise == False
     parser.add_argument(
-        "--disable-layerwise",
-        action="store_false",
+        "--enable-layerwise",
+        action="store_true",
         dest="use_layerwise",
         help=(
-            "Disable layer-wise HiCache loading. When set, hit KV cache is fully transferred "
-            "to HBM before compute."
+            "Enable layer-wise HiCache loading. By default Stout uses non-layerwise mode with page_first layout."
         ),
     )
 
@@ -266,6 +265,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
+
+    # enforce fixed startup memory behavior
+    kwargs["device_mem_layout"] = "page_first"
+    kwargs["host_mem_layout"] = "page_first"
+    kwargs["use_layerwise"] = False
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
