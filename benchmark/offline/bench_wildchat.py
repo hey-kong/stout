@@ -5,8 +5,8 @@ from pathlib import Path
 from random import seed
 
 import pyarrow.parquet as pq
-from minisgl.core import SamplingParams
-from minisgl.llm import LLM
+from stout.core import SamplingParams
+from stout.llm import LLM
 from transformers import AutoTokenizer
 
 LANGS = {"English", "Chinese"}

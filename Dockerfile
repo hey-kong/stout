@@ -42,14 +42,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash --uid 1001 minisgl
+RUN useradd --create-home --shell /bin/bash --uid 1001 stout
 
 # Copy application from builder
-COPY --from=builder --chown=minisgl:minisgl /app /app
+COPY --from=builder --chown=stout:stout /app /app
 
 # Create cache directories
 RUN mkdir -p /app/.cache/huggingface /app/.cache/tvm-ffi /app/.cache/flashinfer \
-    && chown -R minisgl:minisgl /app/.cache
+    && chown -R stout:stout /app/.cache
 
 WORKDIR /app
 
@@ -64,9 +64,9 @@ ENV HF_HOME=/app/.cache/huggingface
 ENV TVM_FFI_CACHE_DIR=/app/.cache/tvm-ffi
 ENV FLASHINFER_WORKSPACE_BASE=/app/.cache/flashinfer
 
-USER minisgl
+USER stout
 
 EXPOSE 1919
 
-ENTRYPOINT ["python", "-m", "minisgl"]
+ENTRYPOINT ["python", "-m", "stout"]
 CMD ["--help"]

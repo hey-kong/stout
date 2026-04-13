@@ -35,5 +35,5 @@ repos:
         args: [--style=file, --verbose]
         exclude: |
           (?x)^(
-            python/minisgl/kernel/csrc/include/minisgl/nccl227.h
+            python/stout/kernel/csrc/include/stout/nccl227.h
           )

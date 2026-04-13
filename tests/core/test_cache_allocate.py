@@ -7,8 +7,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-import minisgl.core as core
-from minisgl.scheduler.cache import CacheManager
+import stout.core as core
+from stout.scheduler.cache import CacheManager
 
 
 @pytest.fixture(autouse=True)
