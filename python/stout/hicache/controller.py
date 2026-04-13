@@ -180,7 +180,11 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
-        num_host_pages = int(num_pages * config.hicache_ratio)
+        if config.kv_offloading_size is not None:
+            num_host_tokens = int(config.kv_offloading_size * (1024 ** 3) / self.token_bytes)
+            num_host_pages = num_host_tokens // config.page_size
+        else:
+            num_host_pages = int(num_pages * config.hicache_ratio)
         num_host_tokens = num_host_pages * config.page_size
         total_bytes_gb = num_host_tokens * self.token_bytes / (1024 ** 3)
         self.free_slots = torch.arange(num_host_tokens, dtype=torch.int32, device="cpu")
