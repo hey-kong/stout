@@ -31,6 +31,7 @@ class HiRadixTreeNode:
         # these fields should be updated later
         self._key: torch.Tensor
         self._cuda_value: torch.Tensor | None = None
+        self._cuda_v_value: Tuple[torch.Tensor, Any] | None = None
         self._host_value: torch.Tensor | None = None
         self._length: int
         self.ghost_timestamp: int | None = None
@@ -43,6 +44,9 @@ class HiRadixTreeNode:
 
     def has_cuda_value(self) -> bool:
         return self._cuda_value is not None
+
+    def has_cuda_v_value(self) -> bool:
+        return self._cuda_v_value is not None
 
     def has_host_value(self) -> bool:
         return self._host_value is not None
@@ -58,6 +62,7 @@ class HiRadixTreeNode:
     ) -> None:
         self._key = key
         self._cuda_value = cuda_value
+        self._cuda_v_value = None
         self._host_value = host_value
         self._length = len(key)
         assert self._length > 0, "Node length must be greater than 0"
@@ -81,6 +86,11 @@ class HiRadixTreeNode:
         return self._cuda_value
 
     @property
+    def cuda_v_value(self) -> Tuple[torch.Tensor, Any]:
+        assert self._cuda_v_value is not None
+        return self._cuda_v_value
+
+    @property
     def host_value(self) -> torch.Tensor:
         assert self._host_value is not None
         return self._host_value
@@ -90,6 +100,9 @@ class HiRadixTreeNode:
         if value is not None:
             assert self._cuda_value is None and len(value) == self.length
         self._cuda_value = value
+        if value is not None:
+            # decompressed V cache is already available on device after loading
+            self._cuda_v_value = None
 
     @host_value.setter
     def host_value(self, value: torch.Tensor | None) -> None:
@@ -101,7 +114,7 @@ class HiRadixTreeNode:
         return self._parent is None
 
     def is_leaf_device(self) -> bool:
-        return all(c._cuda_value is None for c in self.children.values())
+        return all(c._cuda_value is None and c._cuda_v_value is None for c in self.children.values())
 
     def is_leaf_host(self) -> bool:
         return len(self.children) == 0
@@ -122,6 +135,7 @@ class HiRadixTreeNode:
             _maybe_slice(self._cuda_value, slice(0, pos)),
             _maybe_slice(self._host_value, slice(0, pos)),
         )
+        new_node._cuda_v_value = None
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         self.set_key_value(
@@ -129,6 +143,7 @@ class HiRadixTreeNode:
             _maybe_slice(self._cuda_value, slice(pos, None)),
             _maybe_slice(self._host_value, slice(pos, None)),
         )
+        self._cuda_v_value = None
         self.set_parent(new_node)
 
         return new_node
@@ -145,7 +160,13 @@ class HiRadixCacheHandle(BaseCacheHandle):
         node = self.node
         value_list: List[torch.Tensor] = []
         while not node.is_root():
-            value_list.append(node.cuda_value)
+            if node.has_cuda_value():
+                value_list.append(node.cuda_value)
+            elif node.has_cuda_v_value():
+                # K indices are required for K loading when V is served from external cache.
+                value_list.append(node.host_value)
+            else:
+                break
             node = node.parent
         value_list.reverse()
         return torch.cat(value_list)

@@ -6,11 +6,12 @@ from typing import TYPE_CHECKING, List, NamedTuple, cast
 import torch
 import torch.distributed as dist
 from stout.core import get_global_ctx
+from stout.quant import QuantizedCompressor
 from stout.utils import init_logger
 
 if TYPE_CHECKING:
     from stout.kvcache import BaseCacheHandle, BasePrefixCache
-    from stout.kvcache.hiradix_cache import HiRadixPrefixCache
+    from stout.kvcache.hiradix_cache import HiRadixPrefixCache, HiRadixTreeNode
     from stout.scheduler import SchedulerConfig
 
 logger = init_logger(__name__)
@@ -41,6 +42,7 @@ class Transaction(NamedTuple):
     handle: BaseCacheHandle
     host_list: List[torch.Tensor]
     cuda_list: List[torch.Tensor]
+    node_list: List["HiRadixTreeNode"]
 
 
 class Ack(NamedTuple):
@@ -63,8 +65,10 @@ class HiCacheTransferMixin:
             config: SchedulerConfig,
     ) -> None:
         self.load_stream = torch.cuda.Stream()
+        self.decompress_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
         self.load_stream_ctx = torch.cuda.stream(self.load_stream)
+        self.decompress_stream_ctx = torch.cuda.stream(self.decompress_stream)
         self.write_stream_ctx = torch.cuda.stream(self.write_stream)
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
         self.device = cuda_kv[0].device
@@ -85,6 +89,7 @@ class HiCacheTransferMixin:
         self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
         self._host_v_ptrs = _make_ptrs(self._host_kv[1], self.device)
+        self.quant_compressor = QuantizedCompressor(bits=4)
 
     def load_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
         from stout.kernel import transfer_hicache_one_layer
@@ -208,9 +213,21 @@ class HiCacheController(HiCacheTransferMixin):
             cuda_indices: torch.Tensor,
     ) -> None:
         host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
+        node_list = self._collect_host_only_nodes(host_handle)
+        assert len(host_list) == len(node_list)
+        cuda_list: List[torch.Tensor] = []
+        offset = 0
+        for host_indices in host_list:
+            length = len(host_indices)
+            cuda_list.append(cuda_indices[offset: offset + length])
+            offset += length
+        assert offset == len(cuda_indices)
+        for node in node_list:
+            if node._cuda_v_value is None and node._host_value is not None:
+                node._cuda_v_value = self._compress_v_to_external(node._host_value)
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
-        self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
+        self.load_queue.append(Transaction(host_handle, host_list, cuda_list, node_list))
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
@@ -222,7 +239,7 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(host_indices) == needed_len
         cuda_list = self.hiradix_cache.set_host(cuda_handle, host_indices)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
-        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list))
+        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list, []))
         self.start_write()  # do not batch write for now
 
     def start_load(self) -> None:
@@ -232,25 +249,51 @@ class HiCacheController(HiCacheTransferMixin):
         counter = self.counter_ring_buffer[self.ring_index]
         counter.use_layerwise = self.use_layerwise
         self.cuda_pool.set_hicache_counter(counter)
-        host_indices, cuda_indices = self._merge_transactions(self.load_queue)
-        num_tokens = len(host_indices)
+        num_tokens = sum(sum(len(v) for v in tx.host_list) for tx in self.load_queue)
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if self.use_layerwise:
                 for i in range(self.num_layers):
-                    self.load_one(host_indices, cuda_indices, i)
+                    for tx in self.load_queue:
+                        for host_indices, cuda_indices, node in zip(tx.host_list, tx.cuda_list, tx.node_list):
+                            if node._cuda_v_value is not None:
+                                self._load_k_only_one(host_indices, cuda_indices, i)
+                            else:
+                                self.load_one(host_indices.to(self.device, non_blocking=True), cuda_indices, i)
                     counter.events[i].record(self.load_stream)
-            elif self.pagewise_load:
-                self.load_pages(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
-                self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
+                for tx in self.load_queue:
+                    for host_indices, cuda_indices, node in zip(tx.host_list, tx.cuda_list, tx.node_list):
+                        if node._cuda_v_value is not None:
+                            self._load_k_only_all(host_indices, cuda_indices)
+                        elif self.pagewise_load:
+                            self.load_pages(
+                                host_indices=host_indices.to(self.device, non_blocking=True),
+                                cuda_indices=cuda_indices,
+                            )
+                        else:
+                            self.load_all(
+                                host_indices=host_indices.to(self.device, non_blocking=True),
+                                cuda_indices=cuda_indices,
+                            )
+            decomp_event = _create_event()
+            with self.decompress_stream_ctx:
+                self.decompress_stream.wait_stream(current_stream)
+                for tx in self.load_queue:
+                    for _, cuda_indices, node in zip(tx.host_list, tx.cuda_list, tx.node_list):
+                        if node._cuda_v_value is None:
+                            continue
+                        self._decompress_v_to_cuda(node, cuda_indices)
+                decomp_event.record(self.decompress_stream)
+            self.load_stream.wait_event(decomp_event)
             counter.finish_event.record(self.load_stream)
 
-        # NOTE: must record here to avoid use after free
-        host_indices.record_stream(self.load_stream)
-        cuda_indices.record_stream(self.load_stream)
+        for tx in self.load_queue:
+            for host_indices, cuda_indices in zip(tx.host_list, tx.cuda_list):
+                host_indices.record_stream(self.load_stream)
+                cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
         self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
@@ -310,11 +353,51 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(txs) > 0
         host_list: List[torch.Tensor] = []
         cuda_list: List[torch.Tensor] = []
-        for _, host_values, cuda_values in txs:
+        for _, host_values, cuda_values, _ in txs:
             host_list.extend(host_values)
             cuda_list.extend(cuda_values)
         host_indices, cuda_indices = torch.cat(host_list), torch.cat(cuda_list)
         return host_indices.to(self.device, non_blocking=True), cuda_indices
+
+    def _collect_host_only_nodes(self, host_handle: BaseCacheHandle) -> List["HiRadixTreeNode"]:
+        node = cast("HiRadixCacheHandle", host_handle).node
+        nodes: List["HiRadixTreeNode"] = []
+        while not node.is_root() and node.on_host_only():
+            nodes.append(node)
+            node = node.parent
+        nodes.reverse()
+        return nodes
+
+    def _compress_v_to_external(self, host_indices: torch.Tensor):
+        num_tokens = len(host_indices)
+        num_pages = num_tokens // self.page_size
+        with torch.inference_mode():
+            v_layers = [
+                self._host_kv[1][i][host_indices].to(self.device, non_blocking=True).view(
+                    num_pages, self.page_size, -1
+                )
+                for i in range(self.num_layers)
+            ]
+            v_stack = torch.stack(v_layers, dim=2).view(num_pages, self.page_size, self.num_layers, -1)
+            num_kv_heads = self._cuda_page[1].shape[-2]
+            head_dim = self._cuda_page[1].shape[-1]
+            v_cache = v_stack.view(num_pages, self.page_size, self.num_layers, num_kv_heads, head_dim)
+            return self.quant_compressor.compress(v_cache)
+
+    def _decompress_v_to_cuda(self, node: "HiRadixTreeNode", cuda_indices: torch.Tensor) -> None:
+        compressed_v, meta = node.cuda_v_value
+        v_cache = self.quant_compressor.decompress(compressed_v, meta)
+        flat_v = v_cache.view(-1, self.num_layers, v_cache.shape[-2] * v_cache.shape[-1])
+        for i in range(self.num_layers):
+            self._cuda_kv[1][i][cuda_indices].copy_(flat_v[:, i], non_blocking=True)
+
+    def _load_k_only_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
+        src = self._host_kv[0][i][host_indices].to(self.device, non_blocking=True)
+        self._cuda_kv[0][i][cuda_indices].copy_(src, non_blocking=True)
+
+    def _load_k_only_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        for i in range(self.num_layers):
+            self._load_k_only_one(host_indices, cuda_indices, i)
 
     def _try_allocate_host(self, length: int) -> torch.Tensor | None:
         if length > len(self.free_slots):
