@@ -178,9 +178,7 @@ class Engine:
             if external_cache_ratio > 0:
                 logger.info(
                     f"Reserving HBM memory for external cache: "
-                    f"{mem_GB(external_memory)} (ratio={external_cache_ratio}, "
-                    f"base=free_hbm_before_model, total_hbm_ratio={total_ratio}, "
-                    f"model_kv_ratio={config.memory_ratio})"
+                    f"{mem_GB(external_memory)}"
                 )
             self.ctx.external_cache_budget_bytes = max(external_memory, 0)
 
