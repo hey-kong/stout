@@ -105,6 +105,8 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    # Reserved HBM budget for external cache (e.g. compressed V cache).
+    external_cache_budget_bytes: int = 0
     _batch: Batch | None = field(default=None, init=False)
 
     @property
