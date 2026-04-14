@@ -159,23 +159,37 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             external_cache_ratio = float(getattr(config, "external_cache_ratio", 0.0))
             assert external_cache_ratio >= 0, "external_cache_ratio must be non-negative"
 
+            total_ratio = config.memory_ratio + external_cache_ratio
+            assert total_ratio <= 1.0, (
+                "memory_ratio + external_cache_ratio must be <= 1.0 "
+                f"(got {total_ratio:.3f})"
+            )
+
+            # Keep memory_ratio and external_cache_ratio independent:
+            # - memory_ratio is the model + KV budget ratio
+            # - external_cache_ratio reserves additional HBM for external cache
+            # Their sum is the total HBM reservation ratio.
             external_memory = int(external_cache_ratio * old_free_memory)
+            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+
             if external_cache_ratio > 0:
                 logger.info(
                     f"Reserving HBM memory for external cache: "
                     f"{mem_GB(external_memory)} (ratio={external_cache_ratio}, "
-                    f"base=free_hbm_before_model)"
+                    f"base=free_hbm_before_model, total_hbm_ratio={total_ratio}, "
+                    f"model_kv_ratio={config.memory_ratio})"
                 )
-            available_memory -= external_memory
             self.ctx.external_cache_budget_bytes = max(external_memory, 0)
 
             num_pages = available_memory // cache_per_page
 
-        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
+        assert num_pages > 0, (
+            "Not enough memory for KV cache. Try reducing --external-cache-ratio, "
+            "increasing --memory-ratio, or setting --num-pages explicitly."
+        )
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
         logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")

@@ -237,7 +237,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--external-cache-ratio",
         type=float,
         default=ServerArgs.external_cache_ratio,
-        help="Reserve HBM memory for external cache (e.g. compressed V cache), as a ratio against normal KV cache.",
+        help=(
+            "Reserve extra HBM for external cache (e.g. compressed V cache) as a ratio of "
+            "free HBM before model loading. --memory-ratio controls model+KV budget; "
+            "this flag is independent and added on top."
+        ),
     )
 
     parser.add_argument(
