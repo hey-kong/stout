@@ -189,6 +189,10 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
+        self.external_cache_budget_bytes = int(
+            getattr(get_global_ctx(), "external_cache_budget_bytes", 0)
+        )
+        self.external_cache_used_bytes = 0
         if config.kv_offloading_size is not None:
             num_host_tokens = int(config.kv_offloading_size * (1024 ** 3) / self.token_bytes)
             num_host_pages = num_host_tokens // config.page_size
@@ -202,6 +206,11 @@ class HiCacheController(HiCacheTransferMixin):
             f"({total_bytes_gb:.2f} GB) for host memory pool"
         )
         self.host_pool = self.cuda_pool.create_host_pool(num_host_pages, config.host_mem_layout)
+        if self.external_cache_budget_bytes > 0:
+            logger.info(
+                "External cache budget enabled: "
+                f"{self.external_cache_budget_bytes / (1024 ** 3):.2f} GB"
+            )
 
         # tuple of kv, shape [num_layers, num_pages, num_kv_heads, head_dim]
         super().__init__(
@@ -231,7 +240,10 @@ class HiCacheController(HiCacheTransferMixin):
                 start_event = _create_event(enable_timing=True)
                 finish_event = _create_event(enable_timing=True)
                 start_event.record(torch.cuda.current_stream())
-                node._cuda_v_value = self._compress_v_to_external(node._host_value)
+                compressed = self._compress_v_to_external(node._host_value)
+                if compressed is None:
+                    continue
+                node._cuda_v_value = compressed
                 finish_event.record(torch.cuda.current_stream())
                 finish_event.synchronize()
                 self._log_simple_transaction(
@@ -428,14 +440,31 @@ class HiCacheController(HiCacheTransferMixin):
             num_kv_heads = self._cuda_page[1].shape[-2]
             head_dim = self._cuda_page[1].shape[-1]
             v_cache = v_stack.view(num_pages, self.page_size, self.num_layers, num_kv_heads, head_dim)
-            return self.quant_compressor.compress(v_cache)
+            compressed = self.quant_compressor.compress(v_cache)
+            compressed_bytes = compressed[0].numel() * compressed[0].element_size()
+            if (
+                self.external_cache_budget_bytes > 0
+                and self.external_cache_used_bytes + compressed_bytes > self.external_cache_budget_bytes
+            ):
+                logger.warning(
+                    "Skip external V compression due to budget limit: "
+                    f"used={self.external_cache_used_bytes / (1024 ** 3):.2f} GB, "
+                    f"need={compressed_bytes / (1024 ** 3):.2f} GB, "
+                    f"budget={self.external_cache_budget_bytes / (1024 ** 3):.2f} GB"
+                )
+                return None
+            self.external_cache_used_bytes += compressed_bytes
+            return compressed
 
     def _decompress_v_to_cuda(self, node: "HiRadixTreeNode", cuda_indices: torch.Tensor) -> None:
         compressed_v, meta = node.cuda_v_value
+        compressed_bytes = compressed_v.numel() * compressed_v.element_size()
         v_cache = self.quant_compressor.decompress(compressed_v, meta)
         flat_v = v_cache.view(-1, self.num_layers, v_cache.shape[-2] * v_cache.shape[-1])
         for i in range(self.num_layers):
             self._cuda_kv[1][i][cuda_indices].copy_(flat_v[:, i], non_blocking=True)
+        node._cuda_v_value = None
+        self.external_cache_used_bytes = max(0, self.external_cache_used_bytes - compressed_bytes)
 
     def _load_k_only_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
         src = self._host_kv[0][i][host_indices].to(self.device, non_blocking=True)
