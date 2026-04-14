@@ -159,18 +159,19 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            kv_memory = int(config.memory_ratio * old_free_memory) - model_memory
             external_cache_ratio = float(getattr(config, "external_cache_ratio", 0.0))
+            assert config.memory_ratio >= 0, "memory_ratio must be non-negative"
             assert external_cache_ratio >= 0, "external_cache_ratio must be non-negative"
+            assert (
+                config.memory_ratio + external_cache_ratio <= 1.0
+            ), "memory_ratio + external_cache_ratio must be <= 1.0"
 
-            if external_cache_ratio > 0:
-                kv_memory = int(available_memory / (1.0 + external_cache_ratio))
-                external_memory = available_memory - kv_memory
-                logger.info(
-                    f"Reserving HBM memory for external cache: "
-                    f"{mem_GB(external_memory)} (ratio={external_cache_ratio})"
-                )
-                available_memory = kv_memory
+            available_memory = kv_memory
+            external_memory = int(external_cache_ratio * old_free_memory)
+
+            if external_memory > 0:
+                logger.info(f"Reserving HBM memory for external cache: {mem_GB(external_memory)}")
 
             num_pages = available_memory // cache_per_page
 
