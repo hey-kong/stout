@@ -225,8 +225,11 @@ class HiCacheController(HiCacheTransferMixin):
             cuda_handle: BaseCacheHandle,
             cuda_indices: torch.Tensor,
     ) -> None:
-        host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
+        # Collect host-only nodes before promoting them to cuda-backed nodes.
+        # `set_cuda` mutates each traversed node from host-only -> mixed host+cuda,
+        # so collecting afterwards would return an empty list and break alignment.
         node_list = self._collect_host_only_nodes(host_handle)
+        host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
         assert len(host_list) == len(node_list)
         cuda_list: List[torch.Tensor] = []
         offset = 0
