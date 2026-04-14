@@ -110,7 +110,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--memory-ratio",
         type=float,
         default=ServerArgs.memory_ratio,
-        help="The fraction of GPU memory to use for KV cache.",
+        help="Fraction of HBM budget for model + normal KV cache.",
     )
 
     assert ServerArgs.use_dummy_weight == False
@@ -237,7 +237,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--external-cache-ratio",
         type=float,
         default=ServerArgs.external_cache_ratio,
-        help="Reserve HBM memory for external cache (e.g. compressed V cache), as a ratio against normal KV cache.",
+        help="Additional fraction of HBM reserved for external cache (e.g. compressed V cache).",
     )
 
     parser.add_argument(
