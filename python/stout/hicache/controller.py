@@ -154,6 +154,35 @@ class HiCacheTransferMixin:
                 non_blocking=True,
             )
 
+    def load_k_pages(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        num_pages = len(host_indices) // self.page_size
+
+        # fast path
+        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
+                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
+            host_page_start = int(host_indices[0].item()) // self.page_size
+            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_page_start:host_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            host_page = int(host_indices[i * self.page_size].item()) // self.page_size
+            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page].copy_(
+                self._host_page[0][host_page],
+                non_blocking=True,
+            )
+
+    def load_k_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        for i in range(self.num_layers):
+            src = self._host_kv[0][i][host_indices].to(self.device, non_blocking=True)
+            self._cuda_kv[0][i][cuda_indices].copy_(src, non_blocking=True)
+
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from stout.kernel import transfer_hicache_all_layer
 
@@ -290,7 +319,8 @@ class HiCacheController(HiCacheTransferMixin):
                     for tx in self.load_queue:
                         for host_indices, cuda_indices, node in zip(tx.host_list, tx.cuda_list, tx.node_list):
                             if node._cuda_v_value is not None:
-                                self._load_k_only_one(host_indices, cuda_indices, i)
+                                src = self._host_kv[0][i][host_indices].to(self.device, non_blocking=True)
+                                self._cuda_kv[0][i][cuda_indices].copy_(src, non_blocking=True)
                             else:
                                 self.load_one(host_indices.to(self.device, non_blocking=True), cuda_indices, i)
                     counter.events[i].record(self.load_stream)
@@ -298,7 +328,16 @@ class HiCacheController(HiCacheTransferMixin):
                 for tx in self.load_queue:
                     for host_indices, cuda_indices, node in zip(tx.host_list, tx.cuda_list, tx.node_list):
                         if node._cuda_v_value is not None:
-                            self._load_k_only_all(host_indices, cuda_indices)
+                            if self.pagewise_load:
+                                self.load_k_pages(
+                                    host_indices=host_indices.to(self.device, non_blocking=True),
+                                    cuda_indices=cuda_indices,
+                                )
+                            else:
+                                self.load_k_all(
+                                    host_indices=host_indices.to(self.device, non_blocking=True),
+                                    cuda_indices=cuda_indices,
+                                )
                         elif self.pagewise_load:
                             self.load_pages(
                                 host_indices=host_indices.to(self.device, non_blocking=True),
@@ -468,14 +507,6 @@ class HiCacheController(HiCacheTransferMixin):
             self._cuda_kv[1][i][cuda_indices].copy_(flat_v[:, i], non_blocking=True)
         node._cuda_v_value = None
         self.external_cache_used_bytes = max(0, self.external_cache_used_bytes - compressed_bytes)
-
-    def _load_k_only_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
-        src = self._host_kv[0][i][host_indices].to(self.device, non_blocking=True)
-        self._cuda_kv[0][i][cuda_indices].copy_(src, non_blocking=True)
-
-    def _load_k_only_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
-        for i in range(self.num_layers):
-            self._load_k_only_one(host_indices, cuda_indices, i)
 
     def _try_allocate_host(self, length: int) -> torch.Tensor | None:
         if length > len(self.free_slots):
