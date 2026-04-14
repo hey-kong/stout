@@ -172,7 +172,6 @@ class Engine:
 
             if external_memory > 0:
                 logger.info(f"Reserving HBM memory for external cache: {mem_GB(external_memory)}")
-                available_memory -= external_memory
 
             num_pages = available_memory // cache_per_page
 
