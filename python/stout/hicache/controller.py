@@ -329,8 +329,8 @@ class HiCacheController(HiCacheTransferMixin):
 
         for tx in self.load_queue:
             for host_indices, cuda_indices in zip(tx.host_list, tx.cuda_list):
-                host_indices.record_stream(self.load_stream)
-                cuda_indices.record_stream(self.load_stream)
+                _maybe_record_stream(host_indices, self.load_stream)
+                _maybe_record_stream(cuda_indices, self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
         self.ack_load_queue.append(
@@ -363,8 +363,8 @@ class HiCacheController(HiCacheTransferMixin):
 
         # NOTE: must record stream to avoid use after free
         finish_event.record(self.write_stream)
-        host_indices.record_stream(self.write_stream)
-        cuda_indices.record_stream(self.write_stream)
+        _maybe_record_stream(host_indices, self.write_stream)
+        _maybe_record_stream(cuda_indices, self.write_stream)
         self.write_queue.clear()
         ack_id = self._allocate_ack_id()
         self.ack_write_queue.append(Ack(ack_id, handles, num_tokens, start_event, finish_event))
@@ -532,3 +532,8 @@ def _create_event(enable_timing: bool = False) -> torch.Event:
 
 def _make_ptrs(ts: List[torch.Tensor], device: torch.device):
     return torch.tensor([t.data_ptr() for t in ts], device=device, dtype=torch.uint64)
+
+
+def _maybe_record_stream(tensor: torch.Tensor, stream: torch.cuda.Stream) -> None:
+    if tensor.is_cuda:
+        tensor.record_stream(stream)
