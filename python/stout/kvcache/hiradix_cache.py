@@ -32,6 +32,7 @@ class HiRadixTreeNode:
         self._key: torch.Tensor
         self._cuda_value: torch.Tensor | None = None
         self._cuda_v_value: Tuple[torch.Tensor, Any] | None = None
+        self._cuda_v_ready_event: torch.Event | None = None
         self._host_value: torch.Tensor | None = None
         self._length: int
         self.ghost_timestamp: int | None = None
@@ -63,6 +64,7 @@ class HiRadixTreeNode:
         self._key = key
         self._cuda_value = cuda_value
         self._cuda_v_value = None
+        self._cuda_v_ready_event = None
         self._host_value = host_value
         self._length = len(key)
         assert self._length > 0, "Node length must be greater than 0"
@@ -103,6 +105,7 @@ class HiRadixTreeNode:
         if value is not None:
             # decompressed V cache is already available on device after loading
             self._cuda_v_value = None
+            self._cuda_v_ready_event = None
 
     @host_value.setter
     def host_value(self, value: torch.Tensor | None) -> None:
@@ -136,6 +139,7 @@ class HiRadixTreeNode:
             _maybe_slice(self._host_value, slice(0, pos)),
         )
         new_node._cuda_v_value = None
+        new_node._cuda_v_ready_event = None
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         self.set_key_value(
@@ -144,6 +148,7 @@ class HiRadixTreeNode:
             _maybe_slice(self._host_value, slice(pos, None)),
         )
         self._cuda_v_value = None
+        self._cuda_v_ready_event = None
         self.set_parent(new_node)
 
         return new_node

@@ -69,9 +69,11 @@ class HiCacheTransferMixin:
     ) -> None:
         self.load_stream = torch.cuda.Stream()
         self.decompress_stream = torch.cuda.Stream()
+        self.compress_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
         self.load_stream_ctx = torch.cuda.stream(self.load_stream)
         self.decompress_stream_ctx = torch.cuda.stream(self.decompress_stream)
+        self.compress_stream_ctx = torch.cuda.stream(self.compress_stream)
         self.write_stream_ctx = torch.cuda.stream(self.write_stream)
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
         self.device = cuda_kv[0].device
@@ -271,13 +273,17 @@ class HiCacheController(HiCacheTransferMixin):
             if node._cuda_v_value is None and node._host_value is not None:
                 start_event = _create_event(enable_timing=True)
                 finish_event = _create_event(enable_timing=True)
-                start_event.record(torch.cuda.current_stream())
-                compressed = self._compress_v_to_external(node._host_value)
-                if compressed is None:
-                    continue
-                node._cuda_v_value = compressed
-                finish_event.record(torch.cuda.current_stream())
-                finish_event.synchronize()
+                current_stream = torch.cuda.current_stream()
+                with self.compress_stream_ctx:
+                    self.compress_stream.wait_stream(current_stream)
+                    start_event.record(self.compress_stream)
+                    compressed = self._compress_v_to_external(node._host_value)
+                    if compressed is None:
+                        continue
+                    node._cuda_v_value = compressed
+                    node._cuda_v_ready_event = _create_event()
+                    node._cuda_v_ready_event.record(self.compress_stream)
+                    finish_event.record(self.compress_stream)
                 self._log_simple_transaction(
                     stage="Compress",
                     num_tokens=node.length,
@@ -499,6 +505,8 @@ class HiCacheController(HiCacheTransferMixin):
             return compressed
 
     def _decompress_v_to_cuda(self, node: "HiRadixTreeNode", cuda_indices: torch.Tensor) -> None:
+        if node._cuda_v_ready_event is not None:
+            self.decompress_stream.wait_event(node._cuda_v_ready_event)
         compressed_v, meta = node.cuda_v_value
         compressed_bytes = compressed_v.numel() * compressed_v.element_size()
         v_cache = self.quant_compressor.decompress(compressed_v, meta)
@@ -506,6 +514,7 @@ class HiCacheController(HiCacheTransferMixin):
         for i in range(self.num_layers):
             self._cuda_kv[1][i][cuda_indices].copy_(flat_v[:, i], non_blocking=True)
         node._cuda_v_value = None
+        node._cuda_v_ready_event = None
         self.external_cache_used_bytes = max(0, self.external_cache_used_bytes - compressed_bytes)
 
     def _try_allocate_host(self, length: int) -> torch.Tensor | None:
@@ -526,6 +535,13 @@ class HiCacheController(HiCacheTransferMixin):
         return self.ack_cnt
 
     def _log_transaction(self, ack: Ack, stage: str):
+        if not ack.start_event.query() or not ack.finish_event.query():
+            logger.debug(
+                "Skip HiCache %s timing log for ack %s because CUDA events are not complete yet",
+                stage,
+                ack.ack_id,
+            )
+            return
         dur = ack.start_event.elapsed_time(ack.finish_event)
         bandwidth = (self.token_bytes * ack.num_tokens / (1024 ** 3)) / (dur / 1000)
         logger.info(
@@ -542,6 +558,13 @@ class HiCacheController(HiCacheTransferMixin):
         finish_event: torch.Event,
         ack_id: int | None = None,
     ) -> None:
+        if not start_event.query() or not finish_event.query():
+            logger.debug(
+                "Skip HiCache %s timing log%s because CUDA events are not complete yet",
+                stage,
+                "" if ack_id is None else f" [ack={ack_id}]",
+            )
+            return
         dur = start_event.elapsed_time(finish_event)
         bandwidth = (bytes_per_token * num_tokens / (1024 ** 3)) / (dur / 1000)
         if ack_id is None:
