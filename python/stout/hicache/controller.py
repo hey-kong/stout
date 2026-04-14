@@ -51,6 +51,9 @@ class Ack(NamedTuple):
     num_tokens: int
     start_event: torch.Event
     finish_event: torch.Event
+    extra_tokens: int = 0
+    extra_start_event: torch.Event | None = None
+    extra_finish_event: torch.Event | None = None
 
 
 RING_SIZE = 3  # 3 is enough and safe
@@ -85,6 +88,7 @@ class HiCacheTransferMixin:
         self._cuda_stride_bytes = self._cuda_kv[0][0].stride(0) * item_bytes
         self._host_stride_bytes = self._host_kv[0][0].stride(0) * item_bytes
         self._element_bytes = self._cuda_kv[0][0].shape[-1] * item_bytes
+        self._v_token_bytes = self._element_bytes * self.num_layers
         self._cuda_k_ptrs = _make_ptrs(self._cuda_kv[0], self.device)
         self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
@@ -224,7 +228,19 @@ class HiCacheController(HiCacheTransferMixin):
         assert offset == len(cuda_indices)
         for node in node_list:
             if node._cuda_v_value is None and node._host_value is not None:
+                start_event = _create_event(enable_timing=True)
+                finish_event = _create_event(enable_timing=True)
+                start_event.record(torch.cuda.current_stream())
                 node._cuda_v_value = self._compress_v_to_external(node._host_value)
+                finish_event.record(torch.cuda.current_stream())
+                finish_event.synchronize()
+                self._log_simple_transaction(
+                    stage="Compress",
+                    num_tokens=node.length,
+                    bytes_per_token=self._v_token_bytes,
+                    start_event=start_event,
+                    finish_event=finish_event,
+                )
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
         self.load_queue.append(Transaction(host_handle, host_list, cuda_list, node_list))
@@ -278,14 +294,20 @@ class HiCacheController(HiCacheTransferMixin):
                                 host_indices=host_indices.to(self.device, non_blocking=True),
                                 cuda_indices=cuda_indices,
                             )
+            decomp_start_event = _create_event(enable_timing=True)
+            decomp_finish_event = _create_event(enable_timing=True)
             decomp_event = _create_event()
+            decomp_tokens = 0
             with self.decompress_stream_ctx:
                 self.decompress_stream.wait_stream(current_stream)
+                decomp_start_event.record(self.decompress_stream)
                 for tx in self.load_queue:
                     for _, cuda_indices, node in zip(tx.host_list, tx.cuda_list, tx.node_list):
                         if node._cuda_v_value is None:
                             continue
+                        decomp_tokens += len(cuda_indices)
                         self._decompress_v_to_cuda(node, cuda_indices)
+                decomp_finish_event.record(self.decompress_stream)
                 decomp_event.record(self.decompress_stream)
             self.load_stream.wait_event(decomp_event)
             counter.finish_event.record(self.load_stream)
@@ -296,7 +318,18 @@ class HiCacheController(HiCacheTransferMixin):
                 cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
+        self.ack_load_queue.append(
+            Ack(
+                ack_id,
+                [],
+                num_tokens,
+                counter.start_event,
+                counter.finish_event,
+                decomp_tokens,
+                decomp_start_event,
+                decomp_finish_event,
+            )
+        )
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
 
     def start_write(self) -> None:
@@ -330,6 +363,19 @@ class HiCacheController(HiCacheTransferMixin):
                 break
             finish_count += 1
             self._log_transaction(ack, "Load ")
+            if (
+                ack.extra_tokens > 0
+                and ack.extra_start_event is not None
+                and ack.extra_finish_event is not None
+            ):
+                self._log_simple_transaction(
+                    stage="Decompress",
+                    num_tokens=ack.extra_tokens,
+                    bytes_per_token=self._v_token_bytes,
+                    start_event=ack.extra_start_event,
+                    finish_event=ack.extra_finish_event,
+                    ack_id=ack.ack_id,
+                )
         self.ack_load_queue = self.ack_load_queue[finish_count:]
 
         finish_count = 0
@@ -421,6 +467,28 @@ class HiCacheController(HiCacheTransferMixin):
         bandwidth = (self.token_bytes * ack.num_tokens / (1024 ** 3)) / (dur / 1000)
         logger.info(
             f"HiCache {stage} [{ack.ack_id}]: {ack.num_tokens:>5} tokens: "
+            f"duration = {dur:>5.2f} ms, bandwidth = {bandwidth:>5.2f} GB/s"
+        )
+
+    def _log_simple_transaction(
+        self,
+        stage: str,
+        num_tokens: int,
+        bytes_per_token: int,
+        start_event: torch.Event,
+        finish_event: torch.Event,
+        ack_id: int | None = None,
+    ) -> None:
+        dur = start_event.elapsed_time(finish_event)
+        bandwidth = (bytes_per_token * num_tokens / (1024 ** 3)) / (dur / 1000)
+        if ack_id is None:
+            logger.info(
+                f"HiCache {stage}: {num_tokens:>5} tokens: "
+                f"duration = {dur:>5.2f} ms, bandwidth = {bandwidth:>5.2f} GB/s"
+            )
+            return
+        logger.info(
+            f"HiCache {stage} [{ack_id}]: {num_tokens:>5} tokens: "
             f"duration = {dur:>5.2f} ms, bandwidth = {bandwidth:>5.2f} GB/s"
         )
 
