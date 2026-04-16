@@ -34,7 +34,6 @@ class HiRadixTreeNode:
         self._cuda_v_value: torch.Tensor | None = None
         self._host_value: torch.Tensor | None = None
         self._length: int
-        self.ghost_timestamp: int | None = None
         self.need_external_v_sync: bool = False
 
     def on_cuda_only(self) -> bool:
@@ -315,10 +314,9 @@ class HiRadixPrefixCache(BasePrefixCache):
             # Release external V slots only when host-side data is evicted.
             self._free_external_v(node)
             node.host_value = None
-            node.ghost_timestamp = time.monotonic_ns()
             self.host_size -= node.length
             self.ghost_size += node.length
-            heapq.heappush(self.ghost_heap, (node.ghost_timestamp, node.uuid, node))
+            heapq.heappush(self.ghost_heap, (node.timestamp, node.uuid, node))
             self._trim_ghost_nodes()
 
         return evicted_indices
@@ -407,7 +405,6 @@ class HiRadixPrefixCache(BasePrefixCache):
                 or node.ref_count > 0
                 or not node.is_ghost()
                 or not node.is_leaf()
-                or node.ghost_timestamp is None
             ):
                 continue
 
@@ -422,9 +419,8 @@ class HiRadixPrefixCache(BasePrefixCache):
                 and parent.ref_count == 0
                 and parent.is_ghost()
                 and parent.is_leaf()
-                and parent.ghost_timestamp is not None
             ):
-                heapq.heappush(self.ghost_heap, (parent.ghost_timestamp, parent.uuid, parent))
+                heapq.heappush(self.ghost_heap, (parent.timestamp, parent.uuid, parent))
 
     def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[HiRadixTreeNode, int]:
         prefix_len = 0
@@ -460,7 +456,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         if needed_pages == 0:
             return self.empty_tensor
         if needed_pages > len(self._external_v_free_slots):
-            self._evict_external_v_lru(needed_pages - len(self._external_v_free_slots))
+            self._evict_external_v(needed_pages - len(self._external_v_free_slots))
         if needed_pages > len(self._external_v_free_slots):
             return None
         allocated = self._external_v_free_slots[:needed_pages]
@@ -480,7 +476,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             nodes.extend(node.children.values())
         return candidates
 
-    def _evict_external_v_lru(self, needed_pages: int) -> None:
+    def _evict_external_v(self, needed_pages: int) -> None:
         if needed_pages <= 0:
             return
         candidates = self._collect_nodes_with_cuda_v()
