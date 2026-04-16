@@ -108,6 +108,9 @@ class HiRadixTreeNode:
         return all(c._cuda_value is None for c in self.children.values())
 
     def is_leaf_host(self) -> bool:
+        return all(c._host_value is None for c in self.children.values())
+
+    def is_leaf(self) -> bool:
         return len(self.children) == 0
 
     def get_match_len(self, input_ids: torch.Tensor) -> int:
@@ -391,6 +394,8 @@ class HiRadixPrefixCache(BasePrefixCache):
             node = nodes.pop()
             if not is_host and node._cuda_value is None:
                 continue
+            if is_host and node._host_value is None:
+                continue
             if fn(node):
                 if node.ref_count == 0:
                     leave_nodes.append(node)
@@ -406,7 +411,7 @@ class HiRadixPrefixCache(BasePrefixCache):
                 node.is_root()
                 or node.ref_count > 0
                 or not node.is_ghost()
-                or not node.is_leaf_host()
+                or not node.is_leaf()
                 or node.ghost_timestamp is None
             ):
                 continue
@@ -418,7 +423,7 @@ class HiRadixPrefixCache(BasePrefixCache):
                 not parent.is_root()
                 and parent.ref_count == 0
                 and parent.is_ghost()
-                and parent.is_leaf_host()
+                and parent.is_leaf()
                 and parent.ghost_timestamp is not None
             ):
                 heapq.heappush(self.ghost_heap, (parent.ghost_timestamp, parent.uuid, parent))

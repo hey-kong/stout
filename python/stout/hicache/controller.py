@@ -151,6 +151,29 @@ class HiCacheTransferMixin:
                 non_blocking=True,
             )
 
+    def load_pages_split_kv(
+            self,
+            host_k_indices: torch.Tensor,
+            external_v_indices: torch.Tensor,
+            cuda_indices: torch.Tensor,
+    ) -> None:
+        assert self._external_v_page is not None
+        num_pages = len(cuda_indices) // self.page_size
+
+        for i in range(num_pages):
+            host_k_page = int(host_k_indices[i * self.page_size].item()) // self.page_size
+            external_v_page = int(external_v_indices[i * self.page_size].item()) // self.page_size
+            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page].copy_(
+                self._host_page[0][host_k_page],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page].copy_(
+                self._external_v_page[external_v_page],
+                non_blocking=True,
+            )
+
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from stout.kernel import transfer_hicache_all_layer
 
@@ -166,24 +189,6 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
-    def load_pages_split_kv(
-        self,
-        host_k_indices: torch.Tensor,
-        external_v_indices: torch.Tensor,
-        cuda_indices: torch.Tensor,
-    ) -> None:
-        assert self._external_v_page is not None
-        num_pages = len(cuda_indices) // self.page_size
-
-        for i in range(num_pages):
-            host_k_page = int(host_k_indices[i * self.page_size].item()) // self.page_size
-            external_v_page = int(external_v_indices[i * self.page_size].item()) // self.page_size
-            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
-            self._cuda_page[0][cuda_page].copy_(self._host_page[0][host_k_page], non_blocking=True)
-            self._cuda_page[1][cuda_page].copy_(
-                self._external_v_page[external_v_page], non_blocking=True
-            )
-
 
 class HiCacheController(HiCacheTransferMixin):
     def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
@@ -198,9 +203,9 @@ class HiCacheController(HiCacheTransferMixin):
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
         self.pagewise_load = (
-            config.device_mem_layout == "page_first"
-            and config.host_mem_layout == "page_first"
-            and not self.use_layerwise
+                config.device_mem_layout == "page_first"
+                and config.host_mem_layout == "page_first"
+                and not self.use_layerwise
         )
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
