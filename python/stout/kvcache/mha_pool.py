@@ -142,11 +142,17 @@ class MHAVCache(BaseKVCachePool):
         self.storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
         self.counter: HiCacheCounter | None = None
 
+    def k_cache(self, index: int) -> torch.Tensor:
+        raise RuntimeError("MHAVCache does not store K cache")
+
     def v_cache(self, index: int) -> torch.Tensor:
         return self.v_buffer[index]
 
     def set_hicache_counter(self, counter) -> None:
         self.counter = counter
+
+    def get_kv_storage(self) -> Tuple[torch.Tensor | None, torch.Tensor]:
+        return None, self.v_buffer
 
     def get_v_storage(self) -> torch.Tensor:
         return self.v_buffer
@@ -164,8 +170,8 @@ class MHAVCache(BaseKVCachePool):
             layout=layout,
         )
 
-    def store_v(
-        self, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
+    def store_kv(
+        self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
         self.v_buffer[layer_id].view(self.storage_shape)[out_loc].copy_(v)
         if self.counter is not None:

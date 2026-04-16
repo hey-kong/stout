@@ -95,6 +95,7 @@ def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
 
 __all__ = [
     "create_kvcache_pool",
+    "create_vcache_pool",
     "create_prefix_cache",
     "BaseKVCachePool",
     "BaseCacheHandle",

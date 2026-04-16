@@ -7,7 +7,7 @@ import torch
 from stout.attention import create_attention_backend
 from stout.core import Batch, Context, Req, set_global_ctx
 from stout.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from stout.kvcache import create_kvcache_pool
+from stout.kvcache import create_kvcache_pool, create_vcache_pool
 from stout.layers import set_rope_device
 from stout.models import create_model, load_weight
 from stout.moe import create_moe_backend
