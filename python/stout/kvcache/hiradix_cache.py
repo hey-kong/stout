@@ -31,9 +31,11 @@ class HiRadixTreeNode:
         # these fields should be updated later
         self._key: torch.Tensor
         self._cuda_value: torch.Tensor | None = None
+        self._cuda_v_value: torch.Tensor | None = None
         self._host_value: torch.Tensor | None = None
         self._length: int
         self.ghost_timestamp: int | None = None
+        self.need_external_v_sync: bool = False
 
     def on_cuda_only(self) -> bool:
         return self._cuda_value is not None and self._host_value is None
@@ -54,10 +56,12 @@ class HiRadixTreeNode:
         self,
         key: torch.Tensor,
         cuda_value: torch.Tensor | None,
+        cuda_v_value: torch.Tensor | None = None,
         host_value: torch.Tensor | None = None,
     ) -> None:
         self._key = key
         self._cuda_value = cuda_value
+        self._cuda_v_value = cuda_v_value
         self._host_value = host_value
         self._length = len(key)
         assert self._length > 0, "Node length must be greater than 0"
@@ -120,6 +124,7 @@ class HiRadixTreeNode:
         new_node.set_key_value(
             self._key[:pos],
             _maybe_slice(self._cuda_value, slice(0, pos)),
+            _maybe_slice(self._cuda_v_value, slice(0, pos)),
             _maybe_slice(self._host_value, slice(0, pos)),
         )
         new_node.set_parent(parent)
@@ -127,6 +132,7 @@ class HiRadixTreeNode:
         self.set_key_value(
             self._key[pos:],
             _maybe_slice(self._cuda_value, slice(pos, None)),
+            _maybe_slice(self._cuda_v_value, slice(pos, None)),
             _maybe_slice(self._host_value, slice(pos, None)),
         )
         self.set_parent(new_node)
@@ -165,6 +171,16 @@ class HiRadixPrefixCache(BasePrefixCache):
         self.host_size = 0
         self.ghost_size = 0
         self.ghost_heap: List[Tuple[int, int, HiRadixTreeNode]] = []
+        ctx = get_global_ctx()
+        self._kv_pool = ctx.kv_cache
+        self._external_v_pool = getattr(ctx, "external_v_cache", None)
+        self._external_v_free_slots: torch.Tensor | None = None
+        self._pending_v_sync_nodes: set[HiRadixTreeNode] = set()
+        if self._external_v_pool is not None:
+            num_v_pages = self._external_v_pool.get_v_storage().shape[1]
+            self._external_v_free_slots = (
+                torch.arange(num_v_pages, dtype=torch.int32, device=self.device) * self.page_size
+            )
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, HiRadixCacheHandle)
@@ -204,7 +220,9 @@ class HiRadixPrefixCache(BasePrefixCache):
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         host_node, host_prefix_len = self._tree_walk(input_ids)
+        has_ghost_match = False
         while not host_node.is_root() and host_node.is_ghost():
+            has_ghost_match = True
             host_prefix_len -= host_node.length
             host_node = host_node.parent
         cuda_node, cuda_prefix_len = host_node, host_prefix_len
@@ -216,15 +234,24 @@ class HiRadixPrefixCache(BasePrefixCache):
         node = host_node
         while not node.is_root() and node.on_host_only():
             node.cuda_value = updated_indices[-node.length :]
+            node.need_external_v_sync = True
+            self._pending_v_sync_nodes.add(node)
             updated_indices = updated_indices[: -node.length]
             node = node.parent
         assert len(updated_indices) == 0
         if host_prefix_len != insert_len:  # NOTE: prefix_len < insert_len
             new_node = HiRadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[host_prefix_len:], indices[host_prefix_len:].clone())
+            new_node.set_key_value(
+                input_ids[host_prefix_len:],
+                indices[host_prefix_len:].clone(),
+            )
+            if has_ghost_match:
+                new_node.need_external_v_sync = True
+                self._pending_v_sync_nodes.add(new_node)
             new_node.set_parent(host_node)
             self.evictable_size += new_node.length
             host_node = new_node
+        self._flush_external_v_sync()
         return InsertResult(cuda_prefix_len, HiRadixCacheHandle(insert_len, host_node))
 
     def evict(self, size: int) -> torch.Tensor:
@@ -246,6 +273,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             evicted_indices.append(node.cuda_value)
             self.evictable_size -= node.length
             parent = node.parent
+            self._free_external_v(node)
             if node.on_cuda_only():  # no backup on host, remove the node
                 del parent.children[self.key_fn(node._key)]
             else:  # evict device part, but keep host backup
@@ -312,6 +340,8 @@ class HiRadixPrefixCache(BasePrefixCache):
         while not node.is_root() and node.on_host_only():
             assert node.ref_count == 0
             node.cuda_value = indices[-node.length :]
+            node.need_external_v_sync = True
+            self._pending_v_sync_nodes.add(node)
             indices = indices[: -node.length]
             result.append(node.host_value)
             node = node.parent
@@ -396,6 +426,72 @@ class HiRadixPrefixCache(BasePrefixCache):
             node.timestamp = tic
 
         return node, prefix_len
+
+    def _allocate_external_v_indices(self, length: int) -> torch.Tensor | None:
+        if self._external_v_free_slots is None:
+            return None
+        needed_pages = length // self.page_size
+        if needed_pages == 0:
+            return self.empty_tensor
+        if needed_pages > len(self._external_v_free_slots):
+            return None
+        allocated = self._external_v_free_slots[:needed_pages]
+        self._external_v_free_slots = self._external_v_free_slots[needed_pages:]
+        if self.page_size == 1:
+            return allocated
+        offsets = torch.arange(self.page_size, device=self.device, dtype=torch.int32)
+        return (allocated.unsqueeze(1) + offsets).flatten()
+
+    def _free_external_v(self, node: HiRadixTreeNode) -> None:
+        if self._external_v_free_slots is None or node._cuda_v_value is None:
+            node._cuda_v_value = None
+            return
+        self._external_v_free_slots = torch.cat(
+            [self._external_v_free_slots, node._cuda_v_value[:: self.page_size]]
+        )
+        node._cuda_v_value = None
+
+    def _sync_external_v_cache(self, node: HiRadixTreeNode) -> bool:
+        if self._external_v_pool is None or node._cuda_value is None:
+            return False
+
+        # Reuse existing external V slots if they already match current node length.
+        # This avoids unnecessary free/re-allocate for repeated sync on the same node.
+        cuda_v_indices = node._cuda_v_value
+        if cuda_v_indices is None:
+            cuda_v_indices = self._allocate_external_v_indices(node.length)
+            if cuda_v_indices is None:
+                return False
+            node._cuda_v_value = cuda_v_indices
+        else:
+            assert len(cuda_v_indices) == node.length
+            return True
+
+        if len(cuda_v_indices) == 0:
+            return True
+        assert node.length % self.page_size == 0
+        src_pages = (node._cuda_value[:: self.page_size] // self.page_size).to(torch.int64)
+        dst_pages = (cuda_v_indices[:: self.page_size] // self.page_size).to(torch.int64)
+        src_v = self._kv_pool.get_kv_storage()[1]
+        dst_v = self._external_v_pool.get_v_storage()
+        dst_v[:, dst_pages].copy_(src_v[:, src_pages], non_blocking=True)
+        return True
+
+    def _flush_external_v_sync(self) -> None:
+        if not self._pending_v_sync_nodes:
+            return
+        remaining_nodes: set[HiRadixTreeNode] = set()
+        for node in self._pending_v_sync_nodes:
+            if not node.need_external_v_sync:
+                continue
+            if node._cuda_value is None:
+                remaining_nodes.add(node)
+                continue
+            if not self._sync_external_v_cache(node):
+                remaining_nodes.add(node)
+                continue
+            node.need_external_v_sync = False
+        self._pending_v_sync_nodes = remaining_nodes
 
 
 def _get_key_fn(page_size: int) -> KEY_FN:
