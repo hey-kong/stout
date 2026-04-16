@@ -41,6 +41,8 @@ class Transaction(NamedTuple):
     handle: BaseCacheHandle
     host_list: List[torch.Tensor]
     cuda_list: List[torch.Tensor]
+    cuda_v_src_list: List[torch.Tensor]
+    cuda_v_dst_list: List[torch.Tensor]
 
 
 class Ack(NamedTuple):
@@ -160,6 +162,52 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
+    def load_k_page(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        num_pages = len(host_indices) // self.page_size
+        assert len(host_indices) == len(cuda_indices)
+        assert len(host_indices) % self.page_size == 0
+
+        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
+                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
+            host_page_start = int(host_indices[0].item()) // self.page_size
+            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
+            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_page_start:host_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            host_page = int(host_indices[i * self.page_size].item()) // self.page_size
+            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
+            self._cuda_page[0][cuda_page].copy_(
+                self._host_page[0][host_page],
+                non_blocking=True,
+            )
+
+    def load_v_page(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+        num_pages = len(src_indices) // self.page_size
+        assert len(src_indices) == len(dst_indices)
+        assert len(src_indices) % self.page_size == 0
+
+        if (int(src_indices[-1].item()) == int(src_indices[0].item()) + len(src_indices) - 1
+                and int(dst_indices[-1].item()) == int(dst_indices[0].item()) + len(dst_indices) - 1):
+            src_page_start = int(src_indices[0].item()) // self.page_size
+            dst_page_start = int(dst_indices[0].item()) // self.page_size
+            self._cuda_page[1][dst_page_start:dst_page_start + num_pages].copy_(
+                self._cuda_page[1][src_page_start:src_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            src_page = int(src_indices[i * self.page_size].item()) // self.page_size
+            dst_page = int(dst_indices[i * self.page_size].item()) // self.page_size
+            self._cuda_page[1][dst_page].copy_(
+                self._cuda_page[1][src_page],
+                non_blocking=True,
+            )
+
 
 class HiCacheController(HiCacheTransferMixin):
     def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
@@ -200,6 +248,16 @@ class HiCacheController(HiCacheTransferMixin):
             host_kv=list(self.host_pool.get_kv_storage()),
             config=config,
         )
+        external_ratio = float(getattr(config, "external_cache_ratio", 0.0))
+        if external_ratio > 0 and config.memory_ratio > 0:
+            # external cache only stores V pages, so multiply by 2 from K+V page budget.
+            token_ratio = external_ratio / config.memory_ratio * 2.0
+            external_v_capacity = int(num_pages * config.page_size * token_ratio)
+            self.hiradix_cache.set_external_v_capacity(external_v_capacity)
+            logger.info(
+                f"Enable external V cache LRU: capacity={external_v_capacity} tokens "
+                f"(ratio={token_ratio:.3f})"
+            )
 
     def prepare_load(
             self,
@@ -207,10 +265,14 @@ class HiCacheController(HiCacheTransferMixin):
             cuda_handle: BaseCacheHandle,
             cuda_indices: torch.Tensor,
     ) -> None:
-        host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
+        host_list, cuda_v_src_list, cuda_v_dst_list = self.hiradix_cache.set_cuda(
+            host_handle, cuda_indices
+        )
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
-        self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
+        self.load_queue.append(
+            Transaction(host_handle, host_list, [cuda_indices], cuda_v_src_list, cuda_v_dst_list)
+        )
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
@@ -222,7 +284,7 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(host_indices) == needed_len
         cuda_list = self.hiradix_cache.set_host(cuda_handle, host_indices)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
-        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list))
+        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list, [], []))
         self.start_write()  # do not batch write for now
 
     def start_load(self) -> None:
@@ -232,13 +294,16 @@ class HiCacheController(HiCacheTransferMixin):
         counter = self.counter_ring_buffer[self.ring_index]
         counter.use_layerwise = self.use_layerwise
         self.cuda_pool.set_hicache_counter(counter)
-        host_indices, cuda_indices = self._merge_transactions(self.load_queue)
+        host_indices, cuda_indices, cuda_v_src, cuda_v_dst = self._merge_transactions(self.load_queue)
         num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
+        v_finish_event: torch.Event | None = None
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
-            if self.use_layerwise:
+            if len(cuda_v_src) > 0:
+                self.load_k_page(host_indices, cuda_indices)
+            elif self.use_layerwise:
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
@@ -246,11 +311,24 @@ class HiCacheController(HiCacheTransferMixin):
                 self.load_pages(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
+            if len(cuda_v_src) > 0:
+                for i in range(self.num_layers):
+                    counter.events[i].record(self.load_stream)
+            if len(cuda_v_src) > 0:
+                v_finish_event = _create_event()
+                with self.write_stream_ctx:
+                    self.write_stream.wait_stream(current_stream)
+                    self.load_v_page(cuda_v_src, cuda_v_dst)
+                    v_finish_event.record(self.write_stream)
+                self.load_stream.wait_event(v_finish_event)
             counter.finish_event.record(self.load_stream)
 
         # NOTE: must record here to avoid use after free
         host_indices.record_stream(self.load_stream)
         cuda_indices.record_stream(self.load_stream)
+        if len(cuda_v_src) > 0:
+            cuda_v_src.record_stream(self.write_stream)
+            cuda_v_dst.record_stream(self.write_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
         self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
@@ -260,7 +338,7 @@ class HiCacheController(HiCacheTransferMixin):
         if not self.write_queue:
             return
         handles = [tx.handle for tx in self.write_queue]
-        host_indices, cuda_indices = self._merge_transactions(self.write_queue)
+        host_indices, cuda_indices, _, _ = self._merge_transactions(self.write_queue)
         num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
         start_event = _create_event(enable_timing=True)
@@ -310,11 +388,25 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(txs) > 0
         host_list: List[torch.Tensor] = []
         cuda_list: List[torch.Tensor] = []
-        for _, host_values, cuda_values in txs:
+        cuda_v_src_list: List[torch.Tensor] = []
+        cuda_v_dst_list: List[torch.Tensor] = []
+        for _, host_values, cuda_values, cuda_v_src_values, cuda_v_dst_values in txs:
             host_list.extend(host_values)
             cuda_list.extend(cuda_values)
+            cuda_v_src_list.extend(cuda_v_src_values)
+            cuda_v_dst_list.extend(cuda_v_dst_values)
         host_indices, cuda_indices = torch.cat(host_list), torch.cat(cuda_list)
-        return host_indices.to(self.device, non_blocking=True), cuda_indices
+        cuda_v_src = (
+            torch.cat(cuda_v_src_list).to(self.device, non_blocking=True)
+            if cuda_v_src_list
+            else torch.empty(0, dtype=torch.int32, device=self.device)
+        )
+        cuda_v_dst = (
+            torch.cat(cuda_v_dst_list)
+            if cuda_v_dst_list
+            else torch.empty(0, dtype=torch.int32, device=self.device)
+        )
+        return host_indices.to(self.device, non_blocking=True), cuda_indices, cuda_v_src, cuda_v_dst
 
     def _try_allocate_host(self, length: int) -> torch.Tensor | None:
         if length > len(self.free_slots):

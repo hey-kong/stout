@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, TypeAlias
 
@@ -31,12 +32,13 @@ class HiRadixTreeNode:
         # these fields should be updated later
         self._key: torch.Tensor
         self._cuda_value: torch.Tensor | None = None
+        self._cuda_v_value: torch.Tensor | None = None
         self._host_value: torch.Tensor | None = None
         self._length: int
         self.ghost_timestamp: int | None = None
 
     def on_cuda_only(self) -> bool:
-        return self._cuda_value is not None and self._host_value is None
+        return self._cuda_value is not None and self._host_value is None and self._cuda_v_value is None
 
     def on_host_only(self) -> bool:
         return self._cuda_value is None and self._host_value is not None
@@ -44,11 +46,14 @@ class HiRadixTreeNode:
     def has_cuda_value(self) -> bool:
         return self._cuda_value is not None
 
+    def has_cuda_v_value(self) -> bool:
+        return self._cuda_v_value is not None
+
     def has_host_value(self) -> bool:
         return self._host_value is not None
 
     def is_ghost(self) -> bool:
-        return self._cuda_value is None and self._host_value is None
+        return self._cuda_value is None and self._cuda_v_value is None and self._host_value is None
 
     def set_key_value(
         self,
@@ -58,6 +63,7 @@ class HiRadixTreeNode:
     ) -> None:
         self._key = key
         self._cuda_value = cuda_value
+        self._cuda_v_value = None
         self._host_value = host_value
         self._length = len(key)
         assert self._length > 0, "Node length must be greater than 0"
@@ -85,6 +91,11 @@ class HiRadixTreeNode:
         assert self._host_value is not None
         return self._host_value
 
+    @property
+    def cuda_v_value(self) -> torch.Tensor:
+        assert self._cuda_v_value is not None
+        return self._cuda_v_value
+
     @cuda_value.setter
     def cuda_value(self, value: torch.Tensor | None) -> None:
         if value is not None:
@@ -96,6 +107,12 @@ class HiRadixTreeNode:
         if value is not None:
             assert self._host_value is None and len(value) == self.length
         self._host_value = value
+
+    @cuda_v_value.setter
+    def cuda_v_value(self, value: torch.Tensor | None) -> None:
+        if value is not None:
+            assert self._cuda_v_value is None and len(value) == self.length
+        self._cuda_v_value = value
 
     def is_root(self) -> bool:
         return self._parent is None
@@ -115,6 +132,7 @@ class HiRadixTreeNode:
     def split_at(self, pos: int) -> HiRadixTreeNode:
         assert 0 < pos < self.length
         parent = self.parent
+        cuda_v_value = self._cuda_v_value
 
         new_node = HiRadixTreeNode(self.key_fn, self.timestamp)
         new_node.set_key_value(
@@ -122,6 +140,7 @@ class HiRadixTreeNode:
             _maybe_slice(self._cuda_value, slice(0, pos)),
             _maybe_slice(self._host_value, slice(0, pos)),
         )
+        new_node.cuda_v_value = _maybe_slice(cuda_v_value, slice(0, pos))
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         self.set_key_value(
@@ -129,6 +148,7 @@ class HiRadixTreeNode:
             _maybe_slice(self._cuda_value, slice(pos, None)),
             _maybe_slice(self._host_value, slice(pos, None)),
         )
+        self.cuda_v_value = _maybe_slice(cuda_v_value, slice(pos, None))
         self.set_parent(new_node)
 
         return new_node
@@ -165,6 +185,9 @@ class HiRadixPrefixCache(BasePrefixCache):
         self.host_size = 0
         self.ghost_size = 0
         self.ghost_heap: List[Tuple[int, int, HiRadixTreeNode]] = []
+        self.external_v_capacity = 0
+        self.external_v_size = 0
+        self.external_v_lru: "OrderedDict[int, HiRadixTreeNode]" = OrderedDict()
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, HiRadixCacheHandle)
@@ -188,7 +211,12 @@ class HiRadixPrefixCache(BasePrefixCache):
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         host_node, host_prefix_len = self._tree_walk(input_ids)
-        while not host_node.is_root() and host_node.is_ghost():
+        while (
+            not host_node.is_root()
+            and not host_node.has_cuda_value()
+            and not host_node.has_cuda_v_value()
+            and not host_node.has_host_value()
+        ):
             host_prefix_len -= host_node.length
             host_node = host_node.parent
         cuda_node, cuda_prefix_len = host_node, host_prefix_len
@@ -211,6 +239,8 @@ class HiRadixPrefixCache(BasePrefixCache):
         while not cuda_node.is_root() and not cuda_node.has_cuda_value():
             cuda_prefix_len -= cuda_node.length
             cuda_node = cuda_node.parent
+        if cuda_prefix_len < host_prefix_len:
+            self._cache_v_on_external(host_node, cuda_node)
         self.evictable_size += host_prefix_len - cuda_prefix_len
         updated_indices = indices[cuda_prefix_len:host_prefix_len].clone()
         node = host_node
@@ -247,6 +277,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             self.evictable_size -= node.length
             parent = node.parent
             if node.on_cuda_only():  # no backup on host, remove the node
+                self._clear_external_v(node)
                 del parent.children[self.key_fn(node._key)]
             else:  # evict device part, but keep host backup
                 node.cuda_value = None
@@ -273,6 +304,8 @@ class HiRadixPrefixCache(BasePrefixCache):
             evicted_size += node.length
             evicted_indices.append(node.host_value)
             node.host_value = None
+            # If DRAM K/V backup is evicted, external V index must be invalidated too.
+            self._clear_external_v(node)
             node.ghost_timestamp = time.monotonic_ns()
             self.host_size -= node.length
             self.ghost_size += node.length
@@ -304,20 +337,30 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
-    def set_cuda(self, handle: BaseCacheHandle, indices: torch.Tensor) -> List[torch.Tensor]:
+    def set_cuda(
+        self, handle: BaseCacheHandle, indices: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         assert isinstance(handle, HiRadixCacheHandle)
         node = handle.node
-        result: List[torch.Tensor] = []
+        host_result: List[torch.Tensor] = []
+        cuda_v_src: List[torch.Tensor] = []
+        cuda_v_dst: List[torch.Tensor] = []
         self.evictable_size += node.length  # update evictable size first
         while not node.is_root() and node.on_host_only():
             assert node.ref_count == 0
             node.cuda_value = indices[-node.length :]
             indices = indices[: -node.length]
-            result.append(node.host_value)
+            host_result.append(node.host_value)
+            if node.has_cuda_v_value():
+                cuda_v_src.append(node.cuda_v_value)
+                cuda_v_dst.append(node.cuda_value)
+                self._touch_external_v(node)
             node = node.parent
         assert len(indices) == 0
-        result.reverse()
-        return result
+        host_result.reverse()
+        cuda_v_src.reverse()
+        cuda_v_dst.reverse()
+        return host_result, cuda_v_src, cuda_v_dst
 
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
@@ -359,6 +402,7 @@ class HiRadixPrefixCache(BasePrefixCache):
                 continue
 
             parent = node.parent
+            self._clear_external_v(node)
             del parent.children[self.key_fn(node._key)]
             self.ghost_size -= node.length
             if (
@@ -369,6 +413,59 @@ class HiRadixPrefixCache(BasePrefixCache):
                 and parent.ghost_timestamp is not None
             ):
                 heapq.heappush(self.ghost_heap, (parent.ghost_timestamp, parent.uuid, parent))
+
+    def _cache_v_on_external(self, host_node: HiRadixTreeNode, cuda_node: HiRadixTreeNode) -> None:
+        if self.external_v_capacity <= 0:
+            return
+        node = host_node
+        while node is not cuda_node:
+            if node.has_cuda_value() and not node.has_cuda_v_value():
+                self._set_external_v(node, node.cuda_value.clone())
+            elif node.has_cuda_v_value():
+                self._touch_external_v(node)
+            node = node.parent
+
+    def set_external_v_capacity(self, capacity: int) -> None:
+        self.external_v_capacity = max(0, capacity)
+        self._trim_external_v()
+
+    def _set_external_v(self, node: HiRadixTreeNode, value: torch.Tensor) -> None:
+        if node.has_cuda_v_value():
+            self.external_v_size -= node.length
+        node._cuda_v_value = value
+        self.external_v_size += node.length
+        self._touch_external_v(node)
+        self._trim_external_v()
+
+    def _clear_external_v(self, node: HiRadixTreeNode) -> None:
+        if not node.has_cuda_v_value():
+            self.external_v_lru.pop(node.uuid, None)
+            return
+        node._cuda_v_value = None
+        self.external_v_size -= node.length
+        self.external_v_lru.pop(node.uuid, None)
+
+    def _touch_external_v(self, node: HiRadixTreeNode) -> None:
+        if node.has_cuda_v_value():
+            self.external_v_lru[node.uuid] = node
+            self.external_v_lru.move_to_end(node.uuid)
+
+    def _trim_external_v(self) -> None:
+        retry = len(self.external_v_lru)
+        while (
+            self.external_v_capacity > 0
+            and self.external_v_size > self.external_v_capacity
+            and retry > 0
+            and self.external_v_lru
+        ):
+            retry -= 1
+            _, node = self.external_v_lru.popitem(last=False)
+            if node.ref_count > 0 or not node.has_cuda_v_value():
+                if node.has_cuda_v_value():
+                    self.external_v_lru[node.uuid] = node
+                continue
+            self._clear_external_v(node)
+            retry = len(self.external_v_lru)
 
     def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[HiRadixTreeNode, int]:
         prefix_len = 0
