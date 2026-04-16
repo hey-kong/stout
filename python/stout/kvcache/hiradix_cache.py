@@ -460,6 +460,8 @@ class HiRadixPrefixCache(BasePrefixCache):
         if needed_pages == 0:
             return self.empty_tensor
         if needed_pages > len(self._external_v_free_slots):
+            self._evict_external_v_lru(needed_pages - len(self._external_v_free_slots))
+        if needed_pages > len(self._external_v_free_slots):
             return None
         allocated = self._external_v_free_slots[:needed_pages]
         self._external_v_free_slots = self._external_v_free_slots[needed_pages:]
@@ -467,6 +469,31 @@ class HiRadixPrefixCache(BasePrefixCache):
             return allocated
         offsets = torch.arange(self.page_size, device=self.device, dtype=torch.int32)
         return (allocated.unsqueeze(1) + offsets).flatten()
+
+    def _collect_nodes_with_cuda_v(self) -> List[HiRadixTreeNode]:
+        nodes: List[HiRadixTreeNode] = list(self.root_node.children.values())
+        candidates: List[HiRadixTreeNode] = []
+        while nodes:
+            node = nodes.pop()
+            if node._cuda_v_value is not None:
+                candidates.append(node)
+            nodes.extend(node.children.values())
+        return candidates
+
+    def _evict_external_v_lru(self, needed_pages: int) -> None:
+        if needed_pages <= 0:
+            return
+        candidates = self._collect_nodes_with_cuda_v()
+        # Evict the least recently used nodes first.
+        candidates.sort(key=lambda node: node.timestamp)
+        freed_pages = 0
+        for node in candidates:
+            if node._cuda_v_value is None:
+                continue
+            freed_pages += len(node._cuda_v_value) // self.page_size
+            self._free_external_v(node)
+            if freed_pages >= needed_pages:
+                break
 
     def _free_external_v(self, node: HiRadixTreeNode) -> None:
         if self._external_v_free_slots is None or node._cuda_v_value is None:
