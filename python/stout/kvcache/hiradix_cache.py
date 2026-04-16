@@ -232,31 +232,28 @@ class HiRadixPrefixCache(BasePrefixCache):
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
-        host_node, host_prefix_len = self._tree_walk(input_ids)
-        while not host_node.is_root() and host_node.is_ghost():
-            host_prefix_len -= host_node.length
-            host_node = host_node.parent
-        cuda_node, cuda_prefix_len = host_node, host_prefix_len
+        hit_node, hit_prefix_len = self._tree_walk(input_ids)
+        cuda_node, cuda_prefix_len = hit_node, hit_prefix_len
         while not cuda_node.is_root() and not cuda_node.has_cuda_value():
             cuda_prefix_len -= cuda_node.length
             cuda_node = cuda_node.parent
-        if cuda_prefix_len < host_prefix_len:
-            self._mark_external_v_pending(host_node, cuda_node)
-        self.evictable_size += host_prefix_len - cuda_prefix_len
-        updated_indices = indices[cuda_prefix_len:host_prefix_len].clone()
-        node = host_node
-        while not node.is_root() and node.on_host_only():
+        self.evictable_size += hit_prefix_len - cuda_prefix_len
+        updated_indices = indices[cuda_prefix_len:hit_prefix_len].clone()
+        node = hit_node
+        while not node.is_root() and not node.has_cuda_value():
             node.cuda_value = updated_indices[-node.length :]
             updated_indices = updated_indices[: -node.length]
             node = node.parent
         assert len(updated_indices) == 0
-        if host_prefix_len != insert_len:  # NOTE: prefix_len < insert_len
+        if cuda_prefix_len < hit_prefix_len:
+            self._mark_external_v_pending(hit_node, cuda_node)
+        if hit_prefix_len != insert_len:  # NOTE: prefix_len < insert_len
             new_node = HiRadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[host_prefix_len:], indices[host_prefix_len:].clone())
-            new_node.set_parent(host_node)
+            new_node.set_key_value(input_ids[hit_prefix_len:], indices[hit_prefix_len:].clone())
+            new_node.set_parent(hit_node)
             self.evictable_size += new_node.length
-            host_node = new_node
-        return InsertResult(cuda_prefix_len, HiRadixCacheHandle(insert_len, host_node))
+            hit_node = new_node
+        return InsertResult(cuda_prefix_len, HiRadixCacheHandle(insert_len, hit_node))
 
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
