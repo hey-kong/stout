@@ -343,10 +343,14 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
-    def set_cuda(self, handle: BaseCacheHandle, indices: torch.Tensor) -> List[torch.Tensor]:
+    def set_cuda(
+        self, handle: BaseCacheHandle, indices: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[bool]]:
         assert isinstance(handle, HiRadixCacheHandle)
         node = handle.node
-        result: List[torch.Tensor] = []
+        k_result: List[torch.Tensor] = []
+        v_result: List[torch.Tensor] = []
+        v_from_external: List[bool] = []
         self.evictable_size += node.length  # update evictable size first
         while not node.is_root() and node.on_host_only():
             assert node.ref_count == 0
@@ -354,11 +358,19 @@ class HiRadixPrefixCache(BasePrefixCache):
             node.need_external_v_sync = True
             self._pending_v_sync_nodes.add(node)
             indices = indices[: -node.length]
-            result.append(node.host_value)
+            k_result.append(node.host_value)
+            if node._cuda_v_value is not None:
+                v_result.append(node._cuda_v_value)
+                v_from_external.append(True)
+            else:
+                v_result.append(node.host_value)
+                v_from_external.append(False)
             node = node.parent
         assert len(indices) == 0
-        result.reverse()
-        return result
+        k_result.reverse()
+        v_result.reverse()
+        v_from_external.reverse()
+        return k_result, v_result, v_from_external
 
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
