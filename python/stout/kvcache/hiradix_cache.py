@@ -105,10 +105,10 @@ class HiRadixTreeNode:
         return self._parent is None
 
     def is_leaf_device(self) -> bool:
-        return all(c._cuda_value is None for c in self.children.values())
+        return all(c._cuda_value is None and c.is_leaf_device() for c in self.children.values())
 
     def is_leaf_host(self) -> bool:
-        return all(c._host_value is None for c in self.children.values())
+        return all(c._host_value is None and c.is_leaf_host() for c in self.children.values())
 
     def is_leaf(self) -> bool:
         return len(self.children) == 0
@@ -392,16 +392,11 @@ class HiRadixPrefixCache(BasePrefixCache):
         fn = HiRadixTreeNode.is_leaf_host if is_host else HiRadixTreeNode.is_leaf_device
         while len(nodes) > 0:
             node = nodes.pop()
-            if not is_host and node._cuda_value is None:
-                continue
-            if is_host and node._host_value is None:
-                continue
-            if fn(node):
-                if node.ref_count == 0:
-                    leave_nodes.append(node)
-            else:
-                for child in node.children.values():
-                    nodes.append(child)
+            has_value = node._host_value is not None if is_host else node._cuda_value is not None
+            if has_value and fn(node) and node.ref_count == 0:
+                leave_nodes.append(node)
+            for child in node.children.values():
+                nodes.append(child)
         return leave_nodes
 
     def _trim_ghost_nodes(self) -> None:
@@ -417,7 +412,10 @@ class HiRadixPrefixCache(BasePrefixCache):
                 continue
 
             parent = node.parent
-            del parent.children[self.key_fn(node._key)]
+            node_key = self.key_fn(node._key)
+            if parent.children.get(node_key) is not node:
+                continue
+            del parent.children[node_key]
             self.ghost_size -= node.length
             if (
                 not parent.is_root()
