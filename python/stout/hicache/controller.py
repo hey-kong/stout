@@ -87,10 +87,10 @@ class HiCacheTransferMixin:
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
         self._host_v_ptrs = _make_ptrs(self._host_kv[1], self.device)
         external_v_pool = getattr(get_global_ctx(), "external_v_cache", None)
-        self._external_v: List[torch.Tensor] | None = None
+        self._external_v_page: torch.Tensor | None = None
         if external_v_pool is not None:
             _, external_v_storage = external_v_pool.get_kv_storage()
-            self._external_v = [t.view(storage_shape) for t in external_v_storage]
+            self._external_v_page = external_v_storage.permute(1, 2, 0, 3, 4)
 
     def load_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
         from stout.kernel import transfer_hicache_one_layer
@@ -165,6 +165,43 @@ class HiCacheTransferMixin:
             kv_cache_src_stride_bytes=self._cuda_stride_bytes,
             element_size=self._element_bytes,
         )
+
+    def load_pages_external_v(
+        self,
+        host_k_indices: torch.Tensor,
+        external_v_indices: torch.Tensor,
+        cuda_indices: torch.Tensor,
+    ) -> None:
+        assert self._external_v_page is not None
+        num_pages = len(cuda_indices) // self.page_size
+
+        if (
+            int(host_k_indices[-1].item()) == int(host_k_indices[0].item()) + len(host_k_indices) - 1
+            and int(external_v_indices[-1].item()) == int(external_v_indices[0].item()) + len(external_v_indices) - 1
+            and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1
+        ):
+            host_k_page_start = int(host_k_indices[0].item()) // self.page_size
+            external_v_page_start = int(external_v_indices[0].item()) // self.page_size
+            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_k_page_start:host_k_page_start + num_pages],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._external_v_page[external_v_page_start:external_v_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            host_k_page = int(host_k_indices[i * self.page_size].item()) // self.page_size
+            external_v_page = int(external_v_indices[i * self.page_size].item()) // self.page_size
+            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
+            self._cuda_page[0][cuda_page].copy_(self._host_page[0][host_k_page], non_blocking=True)
+            self._cuda_page[1][cuda_page].copy_(
+                self._external_v_page[external_v_page], non_blocking=True
+            )
 
 
 class HiCacheController(HiCacheTransferMixin):
@@ -272,16 +309,14 @@ class HiCacheController(HiCacheTransferMixin):
                     self.load_queue_external_v
                 )
                 num_tokens += len(host_k_indices)
-                assert self._external_v is not None
-                for i in range(self.num_layers):
-                    self._cuda_kv[0][i][cuda_indices].copy_(
-                        self._host_kv[0][i][host_k_indices], non_blocking=True
-                    )
-                    self._cuda_kv[1][i][cuda_indices].copy_(
-                        self._external_v[i][external_v_indices], non_blocking=True
-                    )
-                    if self.use_layerwise:
-                        counter.events[i].record(self.load_stream)
+                assert self.pagewise_load, (
+                    "External-V reload requires pagewise_load=True to keep page-granularity transfers"
+                )
+                self.load_pages_external_v(
+                    host_k_indices=host_k_indices,
+                    external_v_indices=external_v_indices,
+                    cuda_indices=cuda_indices,
+                )
                 host_k_indices.record_stream(self.load_stream)
                 external_v_indices.record_stream(self.load_stream)
                 cuda_indices.record_stream(self.load_stream)
