@@ -281,7 +281,8 @@ class HiRadixPrefixCache(BasePrefixCache):
             evicted_indices.append(node.cuda_value)
             self.evictable_size -= node.length
             parent = node.parent
-            self._free_external_v(node)
+            # Keep external V slots on device-side eviction. They are released
+            # only when host-side data is evicted.
             if node.on_cuda_only():  # no backup on host, remove the node
                 del parent.children[self.key_fn(node._key)]
             else:  # evict device part, but keep host backup
@@ -308,6 +309,8 @@ class HiRadixPrefixCache(BasePrefixCache):
 
             evicted_size += node.length
             evicted_indices.append(node.host_value)
+            # Release external V slots only when host-side data is evicted.
+            self._free_external_v(node)
             node.host_value = None
             node.ghost_timestamp = time.monotonic_ns()
             self.host_size -= node.length
