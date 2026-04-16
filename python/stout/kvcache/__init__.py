@@ -46,6 +46,28 @@ def create_kvcache_pool(
     )
 
 
+def create_vcache_pool(
+    model_config: ModelConfig,
+    num_pages: int,
+    page_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    layout: str,
+):
+    from .mha_pool import MHAVCache
+
+    return MHAVCache(
+        num_kv_heads=model_config.num_kv_heads,
+        num_pages=num_pages,
+        page_size=page_size,
+        num_layers=model_config.num_layers,
+        head_dim=model_config.head_dim,
+        device=device,
+        dtype=dtype,
+        layout=layout,
+    )
+
+
 @SUPPORTED_CACHE_MANAGER.register("naive")
 def create_naive_cache(device: torch.device):
     from .naive_cache import NaivePrefixCache

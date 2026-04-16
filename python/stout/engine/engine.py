@@ -52,11 +52,19 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        self.num_pages, self.external_num_v_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
+            num_pages=self.num_pages + 1,
+            page_size=config.page_size,
+            device=self.device,
+            dtype=self.dtype,
+            layout=config.device_mem_layout,
+        )
+        self.ctx.external_v_cache = self.external_v_cache = create_vcache_pool(
+            model_config=config.model_config,
+            num_pages=self.external_num_v_pages + 1,
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
@@ -146,7 +154,7 @@ class Engine:
         else:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int]:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
@@ -156,7 +164,11 @@ class Engine:
             * self.dtype.itemsize
             * config.model_config.num_layers
         )
+        v_cache_per_page = cache_per_page // 2
+
         num_pages = config.num_page_override
+        external_num_v_pages = 0
+
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
             kv_memory = int(config.memory_ratio * old_free_memory) - model_memory
@@ -174,12 +186,17 @@ class Engine:
                 logger.info(f"Reserving HBM memory for external cache: {mem_GB(external_memory)}")
 
             num_pages = available_memory // cache_per_page
+            external_num_v_pages = external_memory // v_cache_per_page
+        else:
+            external_cache_ratio = float(getattr(config, "external_cache_ratio", 0.0))
+            external_memory = int(external_cache_ratio * old_free_memory)
+            external_num_v_pages = external_memory // v_cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
         logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
-        return num_pages
+        return num_pages, external_num_v_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
