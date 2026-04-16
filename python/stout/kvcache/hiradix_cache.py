@@ -221,8 +221,10 @@ class HiRadixPrefixCache(BasePrefixCache):
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         host_node, host_prefix_len = self._tree_walk(input_ids)
         has_ghost_match = False
+        ghost_match_len = 0
         while not host_node.is_root() and host_node.is_ghost():
             has_ghost_match = True
+            ghost_match_len += host_node.length
             host_prefix_len -= host_node.length
             host_node = host_node.parent
         cuda_node, cuda_prefix_len = host_node, host_prefix_len
@@ -245,10 +247,16 @@ class HiRadixPrefixCache(BasePrefixCache):
                 input_ids[host_prefix_len:],
                 indices[host_prefix_len:].clone(),
             )
-            if has_ghost_match:
-                new_node.need_external_v_sync = True
-                self._pending_v_sync_nodes.add(new_node)
             new_node.set_parent(host_node)
+            if has_ghost_match:
+                sync_len = min(ghost_match_len, new_node.length)
+                if sync_len < new_node.length:
+                    ghost_node = new_node.split_at(sync_len)
+                    ghost_node.need_external_v_sync = True
+                    self._pending_v_sync_nodes.add(ghost_node)
+                else:
+                    new_node.need_external_v_sync = True
+                    self._pending_v_sync_nodes.add(new_node)
             self.evictable_size += new_node.length
             host_node = new_node
         self._flush_external_v_sync()
@@ -454,11 +462,19 @@ class HiRadixPrefixCache(BasePrefixCache):
     def _sync_external_v_cache(self, node: HiRadixTreeNode) -> bool:
         if self._external_v_pool is None or node._cuda_value is None:
             return False
-        self._free_external_v(node)
-        cuda_v_indices = self._allocate_external_v_indices(node.length)
+
+        # Reuse existing external V slots if they already match current node length.
+        # This avoids unnecessary free/re-allocate for repeated sync on the same node.
+        cuda_v_indices = node._cuda_v_value
         if cuda_v_indices is None:
-            return False
-        node._cuda_v_value = cuda_v_indices
+            cuda_v_indices = self._allocate_external_v_indices(node.length)
+            if cuda_v_indices is None:
+                return False
+            node._cuda_v_value = cuda_v_indices
+        else:
+            assert len(cuda_v_indices) == node.length
+            return True
+
         if len(cuda_v_indices) == 0:
             return True
         assert node.length % self.page_size == 0
