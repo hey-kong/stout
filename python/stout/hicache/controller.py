@@ -166,7 +166,7 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
-    def load_pages_host_k_external_v(
+    def load_pages_split_kv(
         self,
         host_k_indices: torch.Tensor,
         external_v_indices: torch.Tensor,
@@ -189,7 +189,7 @@ class HiCacheController(HiCacheTransferMixin):
     def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
         self.hiradix_cache = cast("HiRadixPrefixCache", prefix_cache)
         self.load_queue: List[Transaction] = []
-        self.load_queue_external_v: List[Transaction] = []
+        self.load_queue_split_kv: List[Transaction] = []
         self.write_queue: List[Transaction] = []
         self.ack_load_queue: List[Ack] = []
         self.ack_write_queue: List[Ack] = []
@@ -242,7 +242,7 @@ class HiCacheController(HiCacheTransferMixin):
             offset += length
             tx = Transaction(host_handle, [k_src], [v_src], [cuda_dst])
             if use_external_v:
-                self.load_queue_external_v.append(tx)
+                self.load_queue_split_kv.append(tx)
             else:
                 self.load_queue.append(tx)
 
@@ -260,7 +260,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.start_write()  # do not batch write for now
 
     def start_load(self) -> None:
-        if not self.load_queue and not self.load_queue_external_v:
+        if not self.load_queue and not self.load_queue_split_kv:
             return self.cuda_pool.set_hicache_counter(None)
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
@@ -285,15 +285,15 @@ class HiCacheController(HiCacheTransferMixin):
                 host_indices.record_stream(self.load_stream)
                 cuda_indices.record_stream(self.load_stream)
 
-            if self.load_queue_external_v:
+            if self.load_queue_split_kv:
                 host_k_indices, external_v_indices, cuda_indices = self._merge_transactions(
-                    self.load_queue_external_v
+                    self.load_queue_split_kv
                 )
                 num_tokens += len(host_k_indices)
                 assert self.pagewise_load, (
                     "External-V reload requires pagewise_load=True to keep page-granularity transfers"
                 )
-                self.load_pages_host_k_external_v(
+                self.load_pages_split_kv(
                     host_k_indices=host_k_indices,
                     external_v_indices=external_v_indices,
                     cuda_indices=cuda_indices,
@@ -303,7 +303,7 @@ class HiCacheController(HiCacheTransferMixin):
                 cuda_indices.record_stream(self.load_stream)
             counter.finish_event.record(self.load_stream)
         self.load_queue.clear()
-        self.load_queue_external_v.clear()
+        self.load_queue_split_kv.clear()
         ack_id = self._allocate_ack_id()
         self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
