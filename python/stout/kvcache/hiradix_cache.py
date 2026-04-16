@@ -221,8 +221,10 @@ class HiRadixPrefixCache(BasePrefixCache):
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         host_node, host_prefix_len = self._tree_walk(input_ids)
         has_ghost_match = False
+        ghost_match_len = 0
         while not host_node.is_root() and host_node.is_ghost():
             has_ghost_match = True
+            ghost_match_len += host_node.length
             host_prefix_len -= host_node.length
             host_node = host_node.parent
         cuda_node, cuda_prefix_len = host_node, host_prefix_len
@@ -245,10 +247,16 @@ class HiRadixPrefixCache(BasePrefixCache):
                 input_ids[host_prefix_len:],
                 indices[host_prefix_len:].clone(),
             )
-            if has_ghost_match:
-                new_node.need_external_v_sync = True
-                self._pending_v_sync_nodes.add(new_node)
             new_node.set_parent(host_node)
+            if has_ghost_match:
+                sync_len = min(ghost_match_len, new_node.length)
+                if sync_len < new_node.length:
+                    ghost_node = new_node.split_at(sync_len)
+                    ghost_node.need_external_v_sync = True
+                    self._pending_v_sync_nodes.add(ghost_node)
+                else:
+                    new_node.need_external_v_sync = True
+                    self._pending_v_sync_nodes.add(new_node)
             self.evictable_size += new_node.length
             host_node = new_node
         self._flush_external_v_sync()
