@@ -87,6 +87,7 @@ class HiCacheTransferMixin:
         self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
         self._host_v_ptrs = _make_ptrs(self._host_kv[1], self.device)
+        self._external_v_page: torch.Tensor | None = None
 
     def load_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
         from stout.kernel import transfer_hicache_one_layer
@@ -186,6 +187,7 @@ class HiCacheTransferMixin:
             )
 
     def load_v_page(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+        assert self._external_v_page is not None
         num_pages = len(src_indices) // self.page_size
         assert len(src_indices) == len(dst_indices)
         assert len(src_indices) % self.page_size == 0
@@ -195,7 +197,7 @@ class HiCacheTransferMixin:
             src_page_start = int(src_indices[0].item()) // self.page_size
             dst_page_start = int(dst_indices[0].item()) // self.page_size
             self._cuda_page[1][dst_page_start:dst_page_start + num_pages].copy_(
-                self._cuda_page[1][src_page_start:src_page_start + num_pages],
+                self._external_v_page[src_page_start:src_page_start + num_pages],
                 non_blocking=True,
             )
             return
@@ -204,6 +206,30 @@ class HiCacheTransferMixin:
             src_page = int(src_indices[i * self.page_size].item()) // self.page_size
             dst_page = int(dst_indices[i * self.page_size].item()) // self.page_size
             self._cuda_page[1][dst_page].copy_(
+                self._external_v_page[src_page],
+                non_blocking=True,
+            )
+
+    def store_v_page(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+        assert self._external_v_page is not None
+        num_pages = len(src_indices) // self.page_size
+        assert len(src_indices) == len(dst_indices)
+        assert len(src_indices) % self.page_size == 0
+
+        if (int(src_indices[-1].item()) == int(src_indices[0].item()) + len(src_indices) - 1
+                and int(dst_indices[-1].item()) == int(dst_indices[0].item()) + len(dst_indices) - 1):
+            src_page_start = int(src_indices[0].item()) // self.page_size
+            dst_page_start = int(dst_indices[0].item()) // self.page_size
+            self._external_v_page[dst_page_start:dst_page_start + num_pages].copy_(
+                self._cuda_page[1][src_page_start:src_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            src_page = int(src_indices[i * self.page_size].item()) // self.page_size
+            dst_page = int(dst_indices[i * self.page_size].item()) // self.page_size
+            self._external_v_page[dst_page].copy_(
                 self._cuda_page[1][src_page],
                 non_blocking=True,
             )
@@ -249,11 +275,13 @@ class HiCacheController(HiCacheTransferMixin):
             config=config,
         )
         external_ratio = float(getattr(config, "external_cache_ratio", 0.0))
+        self.external_v_free_slots = torch.empty(0, dtype=torch.int32, device=self.device)
         if external_ratio > 0 and config.memory_ratio > 0:
             # external cache only stores V pages, so multiply by 2 from K+V page budget.
             token_ratio = external_ratio / config.memory_ratio * 2.0
             external_v_capacity = int(num_pages * config.page_size * token_ratio)
             self.hiradix_cache.set_external_v_capacity(external_v_capacity)
+            self._init_external_v_pool(external_v_capacity)
             logger.info(
                 f"Enable external V cache LRU: capacity={external_v_capacity} tokens "
                 f"(ratio={token_ratio:.3f})"
@@ -275,6 +303,7 @@ class HiCacheController(HiCacheTransferMixin):
         )
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
+        self._cache_pending_external_v()
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
         if needed_len < self.page_size:
             return
@@ -286,6 +315,33 @@ class HiCacheController(HiCacheTransferMixin):
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
         self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list, [], []))
         self.start_write()  # do not batch write for now
+
+    def _cache_pending_external_v(self) -> None:
+        if self._external_v_page is None:
+            return
+        nodes = self.hiradix_cache.pop_external_v_pending()
+        if not nodes:
+            return
+        total_len = sum(node.length for node in nodes)
+        if total_len <= 0:
+            return
+        external_indices = self._allocate_external_v(total_len)
+        src_indices = torch.cat([node.cuda_value for node in nodes])
+        start = 0
+        reclaimed: List[torch.Tensor] = []
+        for node in nodes:
+            end = start + node.length
+            reclaimed.extend(
+                self.hiradix_cache.set_external_v_for_node(node, external_indices[start:end].clone())
+            )
+            start = end
+        if reclaimed:
+            self.external_v_free_slots = torch.cat([self.external_v_free_slots] + reclaimed)
+        with self.write_stream_ctx:
+            self.write_stream.wait_stream(torch.cuda.current_stream())
+            self.store_v_page(src_indices=src_indices, dst_indices=external_indices)
+        src_indices.record_stream(self.write_stream)
+        external_indices.record_stream(self.write_stream)
 
     def start_load(self) -> None:
         if not self.load_queue:
@@ -415,6 +471,31 @@ class HiCacheController(HiCacheTransferMixin):
             if length > len(self.free_slots):  # give up if still not enough
                 return None
         allocated, self.free_slots = self.free_slots[:length], self.free_slots[length:]
+        return allocated
+
+    def _init_external_v_pool(self, capacity_tokens: int) -> None:
+        num_pages = capacity_tokens // self.page_size
+        capacity_tokens = num_pages * self.page_size
+        if capacity_tokens <= 0:
+            return
+        self.hiradix_cache.set_external_v_capacity(capacity_tokens)
+        num_layers = self.num_layers
+        _, _, _, num_kv_heads, head_dim = self._cuda_page[1].shape
+        self._external_v_page = torch.empty(
+            (num_pages, self.page_size, num_layers, num_kv_heads, head_dim),
+            device=self.device,
+            dtype=self._cuda_page[1].dtype,
+        )
+        self.external_v_free_slots = torch.arange(capacity_tokens, dtype=torch.int32, device=self.device)
+
+    def _allocate_external_v(self, length: int) -> torch.Tensor:
+        if length > len(self.external_v_free_slots):
+            evicted = self.hiradix_cache.evict_external_v(length - len(self.external_v_free_slots))
+            if evicted:
+                self.external_v_free_slots = torch.cat([self.external_v_free_slots] + evicted)
+        assert length <= len(self.external_v_free_slots), "Not enough external V slots"
+        allocated = self.external_v_free_slots[:length]
+        self.external_v_free_slots = self.external_v_free_slots[length:]
         return allocated
 
     def _allocate_counter(self) -> HiCacheCounter:

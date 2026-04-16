@@ -188,6 +188,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         self.external_v_capacity = 0
         self.external_v_size = 0
         self.external_v_lru: "OrderedDict[int, HiRadixTreeNode]" = OrderedDict()
+        self.external_v_pending: Dict[int, HiRadixTreeNode] = {}
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, HiRadixCacheHandle)
@@ -240,7 +241,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             cuda_prefix_len -= cuda_node.length
             cuda_node = cuda_node.parent
         if cuda_prefix_len < host_prefix_len:
-            self._cache_v_on_external(host_node, cuda_node)
+            self._mark_external_v_pending(host_node, cuda_node)
         self.evictable_size += host_prefix_len - cuda_prefix_len
         updated_indices = indices[cuda_prefix_len:host_prefix_len].clone()
         node = host_node
@@ -278,6 +279,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             parent = node.parent
             if node.on_cuda_only():  # no backup on host, remove the node
                 self._clear_external_v(node)
+                self.external_v_pending.pop(node.uuid, None)
                 del parent.children[self.key_fn(node._key)]
             else:  # evict device part, but keep host backup
                 node.cuda_value = None
@@ -306,6 +308,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             node.host_value = None
             # If DRAM K/V backup is evicted, external V index must be invalidated too.
             self._clear_external_v(node)
+            self.external_v_pending.pop(node.uuid, None)
             node.ghost_timestamp = time.monotonic_ns()
             self.host_size -= node.length
             self.ghost_size += node.length
@@ -403,6 +406,7 @@ class HiRadixPrefixCache(BasePrefixCache):
 
             parent = node.parent
             self._clear_external_v(node)
+            self.external_v_pending.pop(node.uuid, None)
             del parent.children[self.key_fn(node._key)]
             self.ghost_size -= node.length
             if (
@@ -414,43 +418,50 @@ class HiRadixPrefixCache(BasePrefixCache):
             ):
                 heapq.heappush(self.ghost_heap, (parent.ghost_timestamp, parent.uuid, parent))
 
-    def _cache_v_on_external(self, host_node: HiRadixTreeNode, cuda_node: HiRadixTreeNode) -> None:
-        if self.external_v_capacity <= 0:
-            return
+    def _mark_external_v_pending(self, host_node: HiRadixTreeNode, cuda_node: HiRadixTreeNode) -> None:
         node = host_node
         while node is not cuda_node:
-            if node.has_cuda_value() and not node.has_cuda_v_value():
-                self._set_external_v(node, node.cuda_value.clone())
-            elif node.has_cuda_v_value():
-                self._touch_external_v(node)
+            if node.has_cuda_value():
+                self.external_v_pending[node.uuid] = node
             node = node.parent
+
+    def pop_external_v_pending(self) -> List[HiRadixTreeNode]:
+        pending = list(self.external_v_pending.values())
+        self.external_v_pending.clear()
+        return pending
 
     def set_external_v_capacity(self, capacity: int) -> None:
         self.external_v_capacity = max(0, capacity)
         self._trim_external_v()
 
-    def _set_external_v(self, node: HiRadixTreeNode, value: torch.Tensor) -> None:
-        if node.has_cuda_v_value():
-            self.external_v_size -= node.length
+    def set_external_v_for_node(self, node: HiRadixTreeNode, value: torch.Tensor) -> List[torch.Tensor]:
+        freed: List[torch.Tensor] = []
+        old = self._clear_external_v(node)
+        if old is not None:
+            freed.append(old)
         node._cuda_v_value = value
         self.external_v_size += node.length
         self._touch_external_v(node)
-        self._trim_external_v()
+        freed.extend(self._trim_external_v())
+        return freed
 
-    def _clear_external_v(self, node: HiRadixTreeNode) -> None:
+    def _clear_external_v(self, node: HiRadixTreeNode) -> torch.Tensor | None:
         if not node.has_cuda_v_value():
             self.external_v_lru.pop(node.uuid, None)
-            return
+            return None
+        value = node.cuda_v_value
         node._cuda_v_value = None
         self.external_v_size -= node.length
         self.external_v_lru.pop(node.uuid, None)
+        return value
 
     def _touch_external_v(self, node: HiRadixTreeNode) -> None:
         if node.has_cuda_v_value():
             self.external_v_lru[node.uuid] = node
             self.external_v_lru.move_to_end(node.uuid)
 
-    def _trim_external_v(self) -> None:
+    def _trim_external_v(self) -> List[torch.Tensor]:
+        freed: List[torch.Tensor] = []
         retry = len(self.external_v_lru)
         while (
             self.external_v_capacity > 0
@@ -464,8 +475,23 @@ class HiRadixPrefixCache(BasePrefixCache):
                 if node.has_cuda_v_value():
                     self.external_v_lru[node.uuid] = node
                 continue
-            self._clear_external_v(node)
+            removed = self._clear_external_v(node)
+            if removed is not None:
+                freed.append(removed)
             retry = len(self.external_v_lru)
+        return freed
+
+    def evict_external_v(self, needed_size: int) -> List[torch.Tensor]:
+        freed: List[torch.Tensor] = []
+        freed_size = 0
+        while freed_size < needed_size and self.external_v_lru:
+            _, node = self.external_v_lru.popitem(last=False)
+            removed = self._clear_external_v(node)
+            if removed is None:
+                continue
+            freed.append(removed)
+            freed_size += node.length
+        return freed
 
     def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[HiRadixTreeNode, int]:
         prefix_len = 0
