@@ -166,7 +166,7 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
-    def load_pages_external_v(
+    def load_pages_host_k_external_v(
         self,
         host_k_indices: torch.Tensor,
         external_v_indices: torch.Tensor,
@@ -174,25 +174,6 @@ class HiCacheTransferMixin:
     ) -> None:
         assert self._external_v_page is not None
         num_pages = len(cuda_indices) // self.page_size
-
-        if (
-            int(host_k_indices[-1].item()) == int(host_k_indices[0].item()) + len(host_k_indices) - 1
-            and int(external_v_indices[-1].item()) == int(external_v_indices[0].item()) + len(external_v_indices) - 1
-            and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1
-        ):
-            host_k_page_start = int(host_k_indices[0].item()) // self.page_size
-            external_v_page_start = int(external_v_indices[0].item()) // self.page_size
-            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
-
-            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[0][host_k_page_start:host_k_page_start + num_pages],
-                non_blocking=True,
-            )
-            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._external_v_page[external_v_page_start:external_v_page_start + num_pages],
-                non_blocking=True,
-            )
-            return
 
         for i in range(num_pages):
             host_k_page = int(host_k_indices[i * self.page_size].item()) // self.page_size
@@ -312,7 +293,7 @@ class HiCacheController(HiCacheTransferMixin):
                 assert self.pagewise_load, (
                     "External-V reload requires pagewise_load=True to keep page-granularity transfers"
                 )
-                self.load_pages_external_v(
+                self.load_pages_host_k_external_v(
                     host_k_indices=host_k_indices,
                     external_v_indices=external_v_indices,
                     cuda_indices=cuda_indices,
