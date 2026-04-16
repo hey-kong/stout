@@ -298,6 +298,9 @@ class HiCacheController(HiCacheTransferMixin):
                 assert self.pagewise_load, (
                     "External-V reload requires pagewise_load=True to keep page-granularity transfers"
                 )
+                logger.info_rank0(
+                    "HiCache Load split-KV: K pages from DRAM(host), V pages from external V cache(HBM)"
+                )
                 self.load_pages_split_kv(
                     host_k_indices=host_k_indices,
                     external_v_indices=external_v_indices,
