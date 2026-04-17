@@ -75,6 +75,7 @@ class HiCacheTransferMixin:
         # [num_pages, page_size, num_layers, num_kv_heads, head_dim]
         self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
         self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
+        self._cuda_v_storage = cuda_kv[1]
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
@@ -86,11 +87,7 @@ class HiCacheTransferMixin:
         self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
         self._host_v_ptrs = _make_ptrs(self._host_kv[1], self.device)
-        external_v_pool = getattr(get_global_ctx(), "external_v_cache", None)
-        self._external_v_page: torch.Tensor | None = None
-        if external_v_pool is not None:
-            _, external_v_storage = external_v_pool.get_kv_storage()
-            self._external_v_page = external_v_storage.permute(1, 2, 0, 3, 4)
+        self._external_v_pool = getattr(get_global_ctx(), "external_v_cache", None)
 
     def load_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
         from stout.kernel import transfer_hicache_one_layer
@@ -157,8 +154,10 @@ class HiCacheTransferMixin:
             external_v_indices: torch.Tensor,
             cuda_indices: torch.Tensor,
     ) -> None:
-        assert self._external_v_page is not None
+        assert self._external_v_pool is not None
         num_pages = len(cuda_indices) // self.page_size
+        src_external_pages = torch.empty(num_pages, device=cuda_indices.device, dtype=torch.int64)
+        dst_cuda_pages = torch.empty(num_pages, device=cuda_indices.device, dtype=torch.int64)
 
         for i in range(num_pages):
             host_k_page = int(host_k_indices[i * self.page_size].item()) // self.page_size
@@ -169,10 +168,14 @@ class HiCacheTransferMixin:
                 self._host_page[0][host_k_page],
                 non_blocking=True,
             )
-            self._cuda_page[1][cuda_page].copy_(
-                self._external_v_page[external_v_page],
-                non_blocking=True,
-            )
+            src_external_pages[i] = external_v_page
+            dst_cuda_pages[i] = cuda_page
+
+        self._external_v_pool.load_pages_to(
+            dst_v=self._cuda_v_storage,
+            src_pages=src_external_pages,
+            dst_pages=dst_cuda_pages,
+        )
 
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from stout.kernel import transfer_hicache_all_layer

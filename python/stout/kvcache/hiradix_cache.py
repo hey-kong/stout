@@ -522,8 +522,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         src_pages = (node._cuda_value[:: self.page_size] // self.page_size).to(torch.int64)
         dst_pages = (cuda_v_indices[:: self.page_size] // self.page_size).to(torch.int64)
         src_v = self._kv_pool.get_kv_storage()[1]
-        dst_v = self._external_v_pool.get_v_storage()
-        dst_v[:, dst_pages].copy_(src_v[:, src_pages], non_blocking=True)
+        self._external_v_pool.store_pages_from(src_v=src_v, src_pages=src_pages, dst_pages=dst_pages)
         return True
 
     def _flush_external_v_sync(self) -> None:
