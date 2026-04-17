@@ -54,7 +54,7 @@ def create_vcache_pool(
     device: torch.device,
     layout: str,
 ):
-    from .mha_pool import MHAVCache
+    from .mha_v_pool import MHAVCache
 
     return MHAVCache(
         num_kv_heads=model_config.num_kv_heads,
