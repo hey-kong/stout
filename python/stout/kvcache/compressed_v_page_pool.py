@@ -7,10 +7,12 @@ import torch
 
 from stout.distributed import get_tp_info
 from stout.quant import int4_ext
-from stout.utils import div_even
+from stout.utils import div_even, init_logger
 
 if TYPE_CHECKING:
     from stout.hicache import HiCacheCounter
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -116,8 +118,26 @@ class CompressedVPageCache:
         if len(src_pages) != len(dst_pages):
             raise ValueError(f"len(src_pages)={len(src_pages)} must equal len(dst_pages)={len(dst_pages)}")
 
+        start_event = finish_event = None
+        stream = None
+        if self._device.type == "cuda":
+            stream = torch.cuda.current_stream(self._device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            finish_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+
         for src_page, dst_page in zip(src_pages.tolist(), dst_pages.tolist()):
             self.store_v_page(int(dst_page), src_v[:, int(src_page)])
+
+        if finish_event is not None and start_event is not None and stream is not None:
+            finish_event.record(stream)
+            finish_event.synchronize()
+            dur_ms = start_event.elapsed_time(finish_event)
+            num_tokens = len(src_pages) * self._page_size
+            logger.info(
+                f"External V Compress: {num_tokens:>5} tokens "
+                f"({len(src_pages):>4} pages), duration = {dur_ms:>5.2f} ms"
+            )
 
     def load_pages_to(
         self,
@@ -136,6 +156,14 @@ class CompressedVPageCache:
         if len(src_pages) != len(dst_pages):
             raise ValueError(f"len(src_pages)={len(src_pages)} must equal len(dst_pages)={len(dst_pages)}")
 
+        start_event = finish_event = None
+        stream = None
+        if self._device.type == "cuda":
+            stream = torch.cuda.current_stream(self._device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            finish_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+
         dst_dtype = dst_v.dtype
         for src_page, dst_page in zip(src_pages.tolist(), dst_pages.tolist()):
             meta = CompressedVPageMeta(
@@ -144,6 +172,16 @@ class CompressedVPageCache:
                 dtype=dst_dtype,
             )
             dst_v[:, int(dst_page)].copy_(self.load_v_page(int(src_page), meta), non_blocking=True)
+
+        if finish_event is not None and start_event is not None and stream is not None:
+            finish_event.record(stream)
+            finish_event.synchronize()
+            dur_ms = start_event.elapsed_time(finish_event)
+            num_tokens = len(src_pages) * self._page_size
+            logger.info(
+                f"External V Decompress: {num_tokens:>5} tokens "
+                f"({len(src_pages):>4} pages), duration = {dur_ms:>5.2f} ms"
+            )
 
     @property
     def device(self) -> torch.device:
