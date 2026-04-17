@@ -369,6 +369,14 @@ class HiCacheController(HiCacheTransferMixin):
                 self.hiradix_cache.lock_handle(handle, unlock=True)
         self.ack_write_queue = self.ack_write_queue[finish_count:]
 
+        # Compress external V pages on the write stream to keep it off the
+        # inference-critical compute stream.
+        if self.hiradix_cache.has_pending_external_v_sync():
+            current_stream = torch.cuda.current_stream()
+            with self.write_stream_ctx:
+                self.write_stream.wait_stream(current_stream)
+                self.hiradix_cache.flush_external_v_sync()
+
     def _merge_transactions(self, txs: List[Transaction]):
         assert len(txs) > 0
         host_list: List[torch.Tensor] = []

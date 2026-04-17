@@ -261,7 +261,6 @@ class HiRadixPrefixCache(BasePrefixCache):
                     self._pending_v_sync_nodes.add(new_node)
             self.evictable_size += new_node.length
             host_node = new_node
-        self._flush_external_v_sync()
         return InsertResult(cuda_prefix_len, HiRadixCacheHandle(insert_len, host_node))
 
     def evict(self, size: int) -> torch.Tensor:
@@ -375,6 +374,12 @@ class HiRadixPrefixCache(BasePrefixCache):
 
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
+
+    def has_pending_external_v_sync(self) -> bool:
+        return len(self._pending_v_sync_nodes) > 0
+
+    def flush_external_v_sync(self) -> None:
+        self._flush_external_v_sync()
 
     @property
     def size_info(self) -> SizeInfo:
