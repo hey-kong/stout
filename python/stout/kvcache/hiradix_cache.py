@@ -261,7 +261,6 @@ class HiRadixPrefixCache(BasePrefixCache):
                     self._pending_v_sync_nodes.add(new_node)
             self.evictable_size += new_node.length
             host_node = new_node
-        self._flush_external_v_sync()
         return InsertResult(cuda_prefix_len, HiRadixCacheHandle(insert_len, host_node))
 
     def evict(self, size: int) -> torch.Tensor:
@@ -375,6 +374,12 @@ class HiRadixPrefixCache(BasePrefixCache):
 
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
+
+    def has_pending_external_v_sync(self) -> bool:
+        return len(self._pending_v_sync_nodes) > 0
+
+    def flush_external_v_sync(self) -> None:
+        self._flush_external_v_sync()
 
     @property
     def size_info(self) -> SizeInfo:
@@ -522,8 +527,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         src_pages = (node._cuda_value[:: self.page_size] // self.page_size).to(torch.int64)
         dst_pages = (cuda_v_indices[:: self.page_size] // self.page_size).to(torch.int64)
         src_v = self._kv_pool.get_kv_storage()[1]
-        dst_v = self._external_v_pool.get_v_storage()
-        dst_v[:, dst_pages].copy_(src_v[:, src_pages], non_blocking=True)
+        self._external_v_pool.store_pages_from(src_v=src_v, src_pages=src_pages, dst_pages=dst_pages)
         return True
 
     def _flush_external_v_sync(self) -> None:
