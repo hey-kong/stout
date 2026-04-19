@@ -64,8 +64,10 @@ class HiCacheTransferMixin:
             config: SchedulerConfig,
     ) -> None:
         self.load_stream = torch.cuda.Stream()
+        self.load_split_v_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
         self.load_stream_ctx = torch.cuda.stream(self.load_stream)
+        self.load_split_v_stream_ctx = torch.cuda.stream(self.load_split_v_stream)
         self.write_stream_ctx = torch.cuda.stream(self.write_stream)
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
         self.device = cuda_kv[0].device
@@ -156,6 +158,7 @@ class HiCacheTransferMixin:
     ) -> None:
         assert self._external_v_pool is not None
         num_pages = len(cuda_indices) // self.page_size
+        host_k_pages = torch.empty(num_pages, device=cuda_indices.device, dtype=torch.int64)
         src_external_pages = torch.empty(num_pages, device=cuda_indices.device, dtype=torch.int64)
         dst_cuda_pages = torch.empty(num_pages, device=cuda_indices.device, dtype=torch.int64)
 
@@ -164,18 +167,27 @@ class HiCacheTransferMixin:
             external_v_page = int(external_v_indices[i * self.page_size].item()) // self.page_size
             cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
 
-            self._cuda_page[0][cuda_page].copy_(
-                self._host_page[0][host_k_page],
-                non_blocking=True,
-            )
+            host_k_pages[i] = host_k_page
             src_external_pages[i] = external_v_page
             dst_cuda_pages[i] = cuda_page
 
-        self._external_v_pool.load_pages_to(
-            dst_v=self._cuda_v_storage,
-            src_pages=src_external_pages,
-            dst_pages=dst_cuda_pages,
-        )
+        for i in range(num_pages):
+            self._cuda_page[0][int(dst_cuda_pages[i].item())].copy_(
+                self._host_page[0][int(host_k_pages[i].item())],
+                non_blocking=True,
+            )
+
+        with self.load_split_v_stream_ctx:
+            self.load_split_v_stream.wait_stream(self.load_stream)
+            self._external_v_pool.load_pages_to(
+                dst_v=self._cuda_v_storage,
+                src_pages=src_external_pages,
+                dst_pages=dst_cuda_pages,
+            )
+            src_external_pages.record_stream(self.load_split_v_stream)
+            dst_cuda_pages.record_stream(self.load_split_v_stream)
+            external_v_indices.record_stream(self.load_split_v_stream)
+            cuda_indices.record_stream(self.load_split_v_stream)
 
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from stout.kernel import transfer_hicache_all_layer
@@ -312,6 +324,7 @@ class HiCacheController(HiCacheTransferMixin):
                 host_k_indices.record_stream(self.load_stream)
                 external_v_indices.record_stream(self.load_stream)
                 cuda_indices.record_stream(self.load_stream)
+                self.load_stream.wait_stream(self.load_split_v_stream)
             counter.finish_event.record(self.load_stream)
         self.load_queue.clear()
         self.load_queue_split_kv.clear()
