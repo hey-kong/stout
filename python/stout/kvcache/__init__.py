@@ -7,7 +7,7 @@ from stout.utils import Registry
 if TYPE_CHECKING:
     import torch
     from stout.models import ModelConfig
-
+    from .compressed_v_page_pool import CompressedVPageCache
 from .base import (
     BaseCacheHandle,
     BaseKVCachePool,
@@ -54,9 +54,9 @@ def create_vcache_pool(
     device: torch.device,
     layout: str,
 ):
-    from .mha_v_pool import MHAVCache
+    from .compressed_v_page_pool import CompressedVPageCache
 
-    return MHAVCache(
+    return CompressedVPageCache(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
@@ -64,7 +64,6 @@ def create_vcache_pool(
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,
-        layout=layout,
     )
 
 
@@ -93,6 +92,14 @@ def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
     return SUPPORTED_CACHE_MANAGER[type](device)
 
 
+def __getattr__(name: str):
+    if name == "CompressedVPageCache":
+        from .compressed_v_page_pool import CompressedVPageCache
+
+        return CompressedVPageCache
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "create_kvcache_pool",
     "create_vcache_pool",
@@ -103,4 +110,5 @@ __all__ = [
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",
+    "CompressedVPageCache",
 ]
