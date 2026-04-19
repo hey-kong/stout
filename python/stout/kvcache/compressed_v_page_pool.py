@@ -151,15 +151,8 @@ class CompressedVPageCache:
         dst_pages_dev = dst_pages.to(dst_v.device, dtype=torch.long)
 
         # Gather packed pages:
-        # [L, num_pages, P, H, packed_D] -> [N, 1, P, L, H, packed_D]
-        # NOTE: keep the singleton "block" dim so batch_decompress slices as
-        #       [1, P, L, H, packed_D], where layer dim stays at index 2.
-        packed_pages = (
-            self.v_buffer[:, src_pages_dev]
-            .permute(1, 2, 0, 3, 4)
-            .unsqueeze(1)
-            .contiguous()
-        )
+        # [L, num_pages, P, H, packed_D] -> [N, P, L, H, packed_D]
+        packed_pages = self.v_buffer[:, src_pages_dev].permute(1, 2, 0, 3, 4).contiguous()
         metas = [
             QuantMeta(
                 scale=self.scale_buffer[int(page)].to(self.v_buffer.device, torch.float32),
@@ -171,8 +164,8 @@ class CompressedVPageCache:
         decompressed = self._compressor.allocate_batch_decompress_buffer(packed_pages, metas)
         self._compressor.batch_decompress(packed_pages, metas, out=decompressed)
 
-        # [N, 1, P, L, H, D] -> [L, N, P, H, D], then scatter into target pages.
-        decompressed = decompressed.squeeze(1).permute(2, 0, 1, 3, 4).contiguous()
+        # [N, P, L, H, D] -> [L, N, P, H, D], then scatter into target pages.
+        decompressed = decompressed.permute(2, 0, 1, 3, 4).contiguous()
         dst_v[:, dst_pages_dev].copy_(decompressed, non_blocking=True)
 
         num_tokens = len(src_pages) * self._page_size
