@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from stout.distributed import get_tp_info
+from stout.quant.quant_compressor import QuantMeta, QuantizedCompressor
 from stout.quant import int4_ext
 from stout.utils import div_even, init_logger
 
@@ -60,6 +61,7 @@ class CompressedVPageCache:
         )
         self.storage_shape = (num_pages * page_size, local_kv_heads, packed_head_dim)
         self.counter: HiCacheCounter | None = None
+        self._compressor = QuantizedCompressor(bits=4)
 
     def set_hicache_counter(self, counter) -> None:
         self.counter = counter
@@ -144,14 +146,27 @@ class CompressedVPageCache:
         if len(src_pages) != len(dst_pages):
             raise ValueError(f"len(src_pages)={len(src_pages)} must equal len(dst_pages)={len(dst_pages)}")
 
-        dst_dtype = dst_v.dtype
-        for src_page, dst_page in zip(src_pages.tolist(), dst_pages.tolist()):
-            meta = CompressedVPageMeta(
-                scale=self.scale_buffer[int(src_page)],
+        # Normalize indices on cache device to enable efficient batched gather/decompress.
+        src_pages_dev = src_pages.to(self.v_buffer.device, dtype=torch.long)
+        dst_pages_dev = dst_pages.to(dst_v.device, dtype=torch.long)
+
+        # Gather packed pages:
+        # [L, num_pages, P, H, packed_D] -> [N, P, L, H, packed_D]
+        packed_pages = self.v_buffer[:, src_pages_dev].permute(1, 2, 0, 3, 4).contiguous()
+        metas = [
+            QuantMeta(
+                scale=self.scale_buffer[int(page)].to(self.v_buffer.device, torch.float32),
                 last_dim=self._head_dim,
-                dtype=dst_dtype,
+                dtype=dst_v.dtype,
             )
-            dst_v[:, int(dst_page)].copy_(self.load_v_page(int(src_page), meta), non_blocking=True)
+            for page in src_pages_dev.tolist()
+        ]
+        decompressed = self._compressor.allocate_batch_decompress_buffer(packed_pages, metas)
+        self._compressor.batch_decompress(packed_pages, metas, out=decompressed)
+
+        # [N, P, L, H, D] -> [L, N, P, H, D], then scatter into target pages.
+        decompressed = decompressed.permute(2, 0, 1, 3, 4).contiguous()
+        dst_v[:, dst_pages_dev].copy_(decompressed, non_blocking=True)
 
         num_tokens = len(src_pages) * self._page_size
         logger.info(

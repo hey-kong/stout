@@ -110,13 +110,19 @@ class QuantizedCompressor:
             raise TypeError("each meta in metas must be QuantMeta")
 
         if out is None:
-            return torch.stack([
-                self.decompress(v_caches[i], metas[i])
-                for i in range(num_blocks)
-            ], dim=0)
+            outputs = []
+            for i in range(num_blocks):
+                # Keep a leading block dim so INT4 dequant infers layer dim correctly.
+                # Then remove that singleton to preserve original API output shape.
+                out_i = self._decompress_tensor(v_caches[i: i + 1], metas[i]).squeeze(0)
+                outputs.append(out_i)
+            return torch.stack(outputs, dim=0)
 
         for i in range(num_blocks):
-            out[i].copy_(self._decompress_tensor(v_caches[i], metas[i]))
+            # Keep a leading block dim so INT4 dequant infers layer dim correctly.
+            # Then remove that singleton to match out[i] shape.
+            out_i = self._decompress_tensor(v_caches[i: i + 1], metas[i]).squeeze(0)
+            out[i].copy_(out_i)
 
         return out
 
